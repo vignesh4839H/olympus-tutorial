@@ -27,6 +27,20 @@
   `TestRecordAuthWithOAuth2`, which already fails at the pinned commit because
   it needs outbound network.
 
+## Prior art (found by the Scope Gate)
+
+No soft delete, trash or deleted timestamp exists in the code at the pinned commit,
+but prior art does exist:
+
+- closed PR #7462 implements a collection toggle, timestamp stamping, default query
+  hiding and an include-deleted query
+- issue #2866 has the maintainer deferring generalized soft delete "until a more
+  prominent and clear use case arise"
+
+The Scope Gate passed the submission anyway, rating #7462 at most 1 of 30 graded
+functions and reading #2866 as a hedged deferral rather than a decline. Earlier
+notes in this repo wrongly stated that no such PR or issue existed.
+
 ## Feature
 
 Base collections get a `softDelete` option. When it is on, deleting a record
