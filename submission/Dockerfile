@@ -8,9 +8,10 @@ ENV CGO_ENABLED=0
 # -mod=readonly keeps the build from editing go.mod or go.sum, so the committed
 # versions are the ones that get used.
 ENV GOFLAGS="-mod=readonly"
-# go.mod asks for a newer toolchain than some base images ship, so let the go
-# command fetch it here while there is still a network.
-ENV GOTOOLCHAIN=auto
+# go.mod asks for a newer toolchain than some base images ship. Pin it to the
+# exact version go.mod names so the build is reproducible, and fetch it here
+# while there is still a network.
+ENV GOTOOLCHAIN=go1.25.0
 
 # The runtime container is offline, so every module has to be in the module
 # cache before the build finishes.

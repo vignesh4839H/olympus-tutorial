@@ -27,7 +27,7 @@ Everything in this folder is ready to paste into the submission form.
 
 ## 3. Task prompt
 
-See [`task_prompt.md`](./task_prompt.md). 319 words, plain prose, no URLs, pure ASCII.
+See [`task_prompt.md`](./task_prompt.md). 259 words, plain prose, no URLs, pure ASCII.
 
 ## 4. Dockerfile
 
@@ -128,9 +128,9 @@ phase is enough for both test modes to then run with `GOPROXY=off`, i.e. with no
    against a cold module cache. Run **Build Image** on the platform first and check it before
    spending anything on the later steps.
 2. **`go.mod` requires Go 1.25.** If the base image ships something older, the build relies on the
-   go command fetching the newer toolchain; `GOTOOLCHAIN=auto` is set explicitly so this happens
-   during the build, while there is still a network. If the build fails on toolchain resolution,
-   that env line is the thing to look at.
+   go command fetching the newer toolchain; `GOTOOLCHAIN=go1.25.0` pins it to the exact version
+   go.mod names, so this happens during the build while there is still a network. If the build
+   fails on toolchain resolution, that env line is the thing to look at.
 3. **Difficulty is unmeasured.** Reading and writing the binary flavour is the hard half and no
    agent has attempted this yet. Run a **Quick Check** before committing to a full batch: if it
    comes back solved easily the task is too easy, and if it comes back blocked on something
@@ -183,3 +183,48 @@ decides novelty.
      forced on the solver.
 
 `solution.patch` was not touched by any of this, so the meaningful LOC count is still 764.
+
+## 10. Second precheck round
+
+Two warnings came back, both addressed.
+
+1. **Dockerfile — `GOTOOLCHAIN=auto` hurts reproducibility.** Fair point: `auto` lets the
+   toolchain drift over time. Changed to `GOTOOLCHAIN=go1.25.0`, the exact version
+   `go.mod` names. Verified against a cold cache: it fetches precisely go1.25.0 during
+   the build, `go mod verify` reports all modules verified, and both test modes then run
+   offline.
+
+2. **Description — "contains only necessary information" (verdict `request_changes`).**
+   Worth noting this one carried no high-severity items, and the check's own text says
+   only high severity is blocking, so it would not have stopped the submission. All five
+   suggestions were taken anyway, cutting the prompt from 319 to 259 words:
+   - dropped "Dictionaries become maps and arrays become sequences"
+   - dropped the basic scalar mappings, keeping the non-obvious ones the reviewer asked
+     to keep (data to `!!binary`, date to `!!timestamp` as RFC 3339 UTC)
+   - replaced the enumerated XML error cases with a general rule that still names the
+     binary misalignment case: "whether the document is malformed XML, structurally
+     invalid, or a binary document whose header, root reference or offset table does not
+     line up"
+   - dropped "wherever the existing formats are"
+   - dropped "and text escaped as XML requires"
+
+### Residual fairness risk from that trim
+
+Five behaviours the hidden tests assert are no longer stated outright and now rest on
+being discoverable from the repository:
+
+| Assertion | Now rests on |
+| --- | --- |
+| dict to mapping node, array to sequence node | the only sensible mapping, and what every other yq decoder does |
+| `!!str` / `!!int` / `!!float` / `!!bool` tags | `createScalarNode` in the repo already maps these types this way |
+| eight specific XML error cases | the general "not a well formed property list" rule |
+| both names registered for input and output | "the formats yq can read and write" plus the writing paragraph |
+| XML text escaping | an unescaped ampersand is not a well formed XML document |
+
+Each is defensible, but this is the trade the trim buys: a shorter prompt against slightly
+more reliance on inference. If a rollout later fails an agent on one of these rather than
+on the genuinely hard part (the binary flavour), put the relevant sentence back — the
+length check passes comfortably at either size.
+
+`solution.patch` and `test.patch` were not touched this round. Meaningful LOC is still 764,
+and the contract still holds: 35 new tests fail on the clean commit, all pass with the solution.
