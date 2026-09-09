@@ -1,0 +1,1653 @@
+diff --git a/apis/record_soft_delete_280aff_test.go b/apis/record_soft_delete_280aff_test.go
+new file mode 100644
+index 0000000..5bd4c5b
+--- /dev/null
++++ b/apis/record_soft_delete_280aff_test.go
+@@ -0,0 +1,390 @@
++package apis_test
++
++import (
++	"net/http"
++	"strings"
++	"testing"
++
++	"github.com/pocketbase/pocketbase/core"
++	"github.com/pocketbase/pocketbase/tests"
++)
++
++const sdSuperuserToken = "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6InN5d2JoZWNuaDQ2cmhtMCIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoicGJjXzMxNDI2MzU4MjMiLCJleHAiOjI1MjQ2MDQ0NjEsInJlZnJlc2hhYmxlIjp0cnVlfQ.UXgO3j-0BumcugrFjbd7j0M4MQvbrLggLlcu_YNGjoY"
++
++const (
++	sdLiveRecordId    = "sdapilive000001"
++	sdTrashedRecordId = "sdapitrashed001"
++	sdPlainRecordId   = "sdapiplain00001"
++)
++
++// sdApiSetup creates a public soft delete enabled collection holding one live
++// and one trashed record, plus a regular collection for the fallback checks.
++func sdApiSetup(t testing.TB, app core.App) {
++	t.Helper()
++
++	publicRule := ""
++
++	posts := core.NewBaseCollection("sd_api_posts")
++	posts.SoftDelete = true
++	posts.Fields.Add(&core.TextField{Name: "title"})
++	posts.ListRule = &publicRule
++	posts.ViewRule = &publicRule
++	posts.CreateRule = &publicRule
++	posts.UpdateRule = &publicRule
++	posts.DeleteRule = &publicRule
++	if err := app.Save(posts); err != nil {
++		t.Fatalf("failed to save sd_api_posts: %v", err)
++	}
++
++	plain := core.NewBaseCollection("sd_api_plain")
++	plain.Fields.Add(&core.TextField{Name: "title"})
++	plain.ListRule = &publicRule
++	plain.ViewRule = &publicRule
++	plain.CreateRule = &publicRule
++	plain.UpdateRule = &publicRule
++	plain.DeleteRule = &publicRule
++	if err := app.Save(plain); err != nil {
++		t.Fatalf("failed to save sd_api_plain: %v", err)
++	}
++
++	live := core.NewRecord(posts)
++	live.Id = sdLiveRecordId
++	live.Set("title", "live one")
++	if err := app.Save(live); err != nil {
++		t.Fatalf("failed to save the live record: %v", err)
++	}
++
++	trashed := core.NewRecord(posts)
++	trashed.Id = sdTrashedRecordId
++	trashed.Set("title", "trashed one")
++	if err := app.Save(trashed); err != nil {
++		t.Fatalf("failed to save the trashed record: %v", err)
++	}
++	if err := app.Delete(trashed); err != nil {
++		t.Fatalf("failed to trash the record: %v", err)
++	}
++
++	other := core.NewRecord(plain)
++	other.Id = sdPlainRecordId
++	other.Set("title", "plain one")
++	if err := app.Save(other); err != nil {
++		t.Fatalf("failed to save the plain record: %v", err)
++	}
++}
++
++func sdBefore(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
++	sdApiSetup(t, app)
++}
++
++func TestSoftDeleteRecordsListApi(t *testing.T) {
++	t.Parallel()
++
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "the trashed records are hidden by default",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"totalItems":1`,
++				`"id":"` + sdLiveRecordId + `"`,
++			},
++			NotExpectedContent: []string{
++				`"id":"` + sdTrashedRecordId + `"`,
++			},
++		},
++		{
++			Name:           "trashed=only lists just the trashed records",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records?trashed=only",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"totalItems":1`,
++				`"id":"` + sdTrashedRecordId + `"`,
++			},
++			NotExpectedContent: []string{
++				`"id":"` + sdLiveRecordId + `"`,
++			},
++		},
++		{
++			Name:           "trashed=with lists both",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records?trashed=with",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"totalItems":2`,
++				`"id":"` + sdLiveRecordId + `"`,
++				`"id":"` + sdTrashedRecordId + `"`,
++			},
++		},
++		{
++			Name:           "an unknown trashed value is rejected",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records?trashed=yes",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 400,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++		{
++			Name:           "the parameter is ignored for regular collections",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_plain/records?trashed=only",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"totalItems":1`,
++				`"id":"` + sdPlainRecordId + `"`,
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
++
++func TestSoftDeleteRecordViewApi(t *testing.T) {
++	t.Parallel()
++
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "a trashed record is not viewable",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records/" + sdTrashedRecordId,
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 404,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++		{
++			Name:           "a trashed record is viewable with trashed=with",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records/" + sdTrashedRecordId + "?trashed=with",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdTrashedRecordId + `"`,
++			},
++		},
++		{
++			Name:           "a live record is not viewable with trashed=only",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId + "?trashed=only",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 404,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
++
++func TestSoftDeleteRecordDeleteApi(t *testing.T) {
++	t.Parallel()
++
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "deleting moves the record to the trash",
++			Method:         http.MethodDelete,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId,
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 204,
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindTrashedRecordById("sd_api_posts", sdLiveRecordId); err != nil {
++					t.Fatalf("expected the record to be trashed, got %v", err)
++				}
++			},
++		},
++		{
++			Name:           "purge removes the record permanently",
++			Method:         http.MethodDelete,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId + "?purge=true",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 204,
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindRecordByIdWithTrashed("sd_api_posts", sdLiveRecordId); err == nil {
++					t.Fatal("expected the record to be permanently deleted")
++				}
++			},
++		},
++		{
++			Name:           "purge reaches the already trashed records",
++			Method:         http.MethodDelete,
++			URL:            "/api/collections/sd_api_posts/records/" + sdTrashedRecordId + "?purge=true",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 204,
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindRecordByIdWithTrashed("sd_api_posts", sdTrashedRecordId); err == nil {
++					t.Fatal("expected the record to be permanently deleted")
++				}
++			},
++		},
++		{
++			Name:           "a trashed record cannot be deleted without purge",
++			Method:         http.MethodDelete,
++			URL:            "/api/collections/sd_api_posts/records/" + sdTrashedRecordId,
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 404,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
++
++func TestSoftDeleteRecordRestoreApi(t *testing.T) {
++	t.Parallel()
++
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "restoring a trashed record",
++			Method:         http.MethodPost,
++			URL:            "/api/collections/sd_api_posts/records/" + sdTrashedRecordId + "/restore",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdTrashedRecordId + `"`,
++				`"title":"trashed one"`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindRecordById("sd_api_posts", sdTrashedRecordId); err != nil {
++					t.Fatalf("expected the record to be restored, got %v", err)
++				}
++			},
++		},
++		{
++			Name:           "restoring a live record is not found",
++			Method:         http.MethodPost,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId + "/restore",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 404,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++		{
++			Name:           "restoring is unsupported for regular collections",
++			Method:         http.MethodPost,
++			URL:            "/api/collections/sd_api_plain/records/" + sdPlainRecordId + "/restore",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 400,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
++
++func TestSoftDeleteEmptyTrashApi(t *testing.T) {
++	t.Parallel()
++
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "guests cannot empty the trash",
++			Method:         http.MethodDelete,
++			URL:            "/api/collections/sd_api_posts/trash",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 403,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++		{
++			Name:   "superusers can empty the trash",
++			Method: http.MethodDelete,
++			URL:    "/api/collections/sd_api_posts/trash",
++			Headers: map[string]string{
++				"Authorization": sdSuperuserToken,
++			},
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"purged":1`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindRecordByIdWithTrashed("sd_api_posts", sdTrashedRecordId); err == nil {
++					t.Fatal("expected the trashed record to be permanently deleted")
++				}
++
++				if _, err := app.FindRecordById("sd_api_posts", sdLiveRecordId); err != nil {
++					t.Fatalf("expected the live record to be kept, got %v", err)
++				}
++			},
++		},
++		{
++			Name:   "emptying the trash of a regular collection is rejected",
++			Method: http.MethodDelete,
++			URL:    "/api/collections/sd_api_plain/trash",
++			Headers: map[string]string{
++				"Authorization": sdSuperuserToken,
++			},
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 400,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
++
++func TestSoftDeleteDeletedFieldIsNotClientWritable(t *testing.T) {
++	t.Parallel()
++
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "the deleted value of a new record is ignored",
++			Method:         http.MethodPost,
++			URL:            "/api/collections/sd_api_posts/records",
++			Body:           strings.NewReader(`{"title":"sneaky","deleted":"2020-01-01 00:00:00.000Z"}`),
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"title":"sneaky"`,
++				`"deleted":""`,
++			},
++		},
++		{
++			Name:           "the deleted value of an existing record is ignored",
++			Method:         http.MethodPatch,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId,
++			Body:           strings.NewReader(`{"deleted":"2020-01-01 00:00:00.000Z"}`),
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdLiveRecordId + `"`,
++				`"deleted":""`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindRecordById("sd_api_posts", sdLiveRecordId); err != nil {
++					t.Fatalf("expected the record to stay visible, got %v", err)
++				}
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
+diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
+new file mode 100644
+index 0000000..e3326cd
+--- /dev/null
++++ b/core/record_soft_delete_280aff_test.go
+@@ -0,0 +1,945 @@
++package core_test
++
++import (
++	"database/sql"
++	"encoding/json/v2"
++	"errors"
++	"strings"
++	"testing"
++	"time"
++
++	"github.com/pocketbase/dbx"
++	"github.com/pocketbase/pocketbase/core"
++	"github.com/pocketbase/pocketbase/tests"
++	"github.com/pocketbase/pocketbase/tools/types"
++)
++
++// -------------------------------------------------------------------
++// helpers
++// -------------------------------------------------------------------
++
++// sdSetup creates the collections used by the soft delete tests:
++//
++//   - sd_posts    - soft delete enabled, unique index on "title"
++//   - sd_comments - soft delete enabled, cascade delete relation to sd_posts
++//   - sd_plain    - regular collection without the soft delete mode
++func sdSetup(t testing.TB, app core.App) (*core.Collection, *core.Collection, *core.Collection) {
++	t.Helper()
++
++	posts := core.NewBaseCollection("sd_posts")
++	posts.SoftDelete = true
++	posts.Fields.Add(&core.TextField{Name: "title"})
++	posts.AddIndex("idx_sd_posts_title", true, "`title`", "")
++	if err := app.Save(posts); err != nil {
++		t.Fatalf("failed to save sd_posts: %v", err)
++	}
++
++	comments := core.NewBaseCollection("sd_comments")
++	comments.SoftDelete = true
++	comments.Fields.Add(&core.TextField{Name: "message"})
++	comments.Fields.Add(&core.RelationField{
++		Name:          "post",
++		CollectionId:  posts.Id,
++		CascadeDelete: true,
++	})
++	if err := app.Save(comments); err != nil {
++		t.Fatalf("failed to save sd_comments: %v", err)
++	}
++
++	plain := core.NewBaseCollection("sd_plain")
++	plain.Fields.Add(&core.TextField{Name: "title"})
++	if err := app.Save(plain); err != nil {
++		t.Fatalf("failed to save sd_plain: %v", err)
++	}
++
++	return posts, comments, plain
++}
++
++func sdNewRecord(t testing.TB, app core.App, collection *core.Collection, data map[string]any) *core.Record {
++	t.Helper()
++
++	record := core.NewRecord(collection)
++	for k, v := range data {
++		record.Set(k, v)
++	}
++
++	if err := app.Save(record); err != nil {
++		t.Fatalf("failed to save %s record: %v", collection.Name, err)
++	}
++
++	return record
++}
++
++// sdRawExists reports whether the record row is still physically in the table.
++func sdRawExists(t testing.TB, app core.App, collection *core.Collection, id string) bool {
++	t.Helper()
++
++	var total int
++
++	err := app.DB().Select("count(*)").
++		From(collection.Name).
++		AndWhere(dbx.HashExp{"id": id}).
++		Row(&total)
++	if err != nil {
++		t.Fatalf("failed to count the %s rows: %v", collection.Name, err)
++	}
++
++	return total > 0
++}
++
++func sdFindIds(t testing.TB, records []*core.Record) []string {
++	t.Helper()
++
++	ids := make([]string, len(records))
++	for i, r := range records {
++		ids[i] = r.Id
++	}
++
++	return ids
++}
++
++// -------------------------------------------------------------------
++// collection option and schema
++// -------------------------------------------------------------------
++
++func TestSoftDeleteCollectionSchema(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, plain := sdSetup(t, app)
++
++	t.Run("the deleted system field is added", func(t *testing.T) {
++		field := posts.Fields.GetByName(core.FieldNameDeleted)
++		if field == nil {
++			t.Fatal("expected a deleted field to be added")
++		}
++
++		dateField, ok := field.(*core.DateField)
++		if !ok {
++			t.Fatalf("expected a date field, got %T", field)
++		}
++
++		if !dateField.System {
++			t.Fatal("expected the deleted field to be a system one")
++		}
++	})
++
++	t.Run("no deleted field without the option", func(t *testing.T) {
++		if plain.Fields.GetByName(core.FieldNameDeleted) != nil {
++			t.Fatal("expected no deleted field for a regular collection")
++		}
++	})
++
++	t.Run("the deleted column is created", func(t *testing.T) {
++		fresh, err := app.FindCollectionByNameOrId("sd_posts")
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if !fresh.SoftDelete {
++			t.Fatal("expected the softDelete option to be persisted")
++		}
++
++		record := sdNewRecord(t, app, fresh, map[string]any{"title": "column check"})
++		if !record.GetDateTime(core.FieldNameDeleted).IsZero() {
++			t.Fatal("expected a zero deleted value for a new record")
++		}
++	})
++
++	t.Run("turning the option off removes the field", func(t *testing.T) {
++		posts.SoftDelete = false
++		if err := app.Save(posts); err != nil {
++			t.Fatal(err)
++		}
++
++		if posts.Fields.GetByName(core.FieldNameDeleted) != nil {
++			t.Fatal("expected the deleted field to be removed")
++		}
++
++		// restore for the remaining subtests
++		posts.SoftDelete = true
++		if err := app.Save(posts); err != nil {
++			t.Fatal(err)
++		}
++	})
++}
++
++func TestSoftDeleteCollectionSerialization(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, plain := sdSetup(t, app)
++
++	t.Run("regular collections are serialized as before", func(t *testing.T) {
++		raw, err := json.Marshal(plain)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if strings.Contains(string(raw), "softDelete") {
++			t.Fatalf("expected no softDelete key in\n%s", raw)
++		}
++	})
++
++	t.Run("soft delete collections expose the option", func(t *testing.T) {
++		raw, err := json.Marshal(posts)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if !strings.Contains(string(raw), `"softDelete":true`) {
++			t.Fatalf("expected a softDelete key in\n%s", raw)
++		}
++	})
++}
++
++func TestSoftDeleteUniqueIndexes(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	t.Run("the unique index excludes the trashed records", func(t *testing.T) {
++		idx := posts.GetIndex("idx_sd_posts_title")
++		if !strings.Contains(idx, "WHERE") || !strings.Contains(idx, core.FieldNameDeleted) {
++			t.Fatalf("expected a partial unique index, got %q", idx)
++		}
++	})
++
++	t.Run("turning the option off restores the plain index", func(t *testing.T) {
++		posts.SoftDelete = false
++		if err := app.Save(posts); err != nil {
++			t.Fatal(err)
++		}
++
++		idx := posts.GetIndex("idx_sd_posts_title")
++		if strings.Contains(idx, core.FieldNameDeleted) {
++			t.Fatalf("expected the trashed condition to be removed, got %q", idx)
++		}
++	})
++}
++
++func TestSoftDeleteTrashRetentionValidation(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	collection := core.NewBaseCollection("sd_retention")
++	collection.TrashRetention = 60
++
++	if err := app.Save(collection); err == nil {
++		t.Fatal("expected an error when setting a retention without the soft delete mode")
++	}
++
++	collection.SoftDelete = true
++	if err := app.Save(collection); err != nil {
++		t.Fatalf("expected the retention to be accepted with the soft delete mode, got %v", err)
++	}
++}
++
++// -------------------------------------------------------------------
++// delete -> trash
++// -------------------------------------------------------------------
++
++func TestSoftDeleteTrashesInsteadOfRemoving(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, plain := sdSetup(t, app)
++
++	record := sdNewRecord(t, app, posts, map[string]any{"title": "hello"})
++
++	if err := app.Delete(record); err != nil {
++		t.Fatal(err)
++	}
++
++	t.Run("the row is kept", func(t *testing.T) {
++		if !sdRawExists(t, app, posts, record.Id) {
++			t.Fatal("expected the record row to be kept")
++		}
++	})
++
++	t.Run("the model is marked as trashed", func(t *testing.T) {
++		if !record.IsTrashed() {
++			t.Fatal("expected the in-memory record to be marked as trashed")
++		}
++
++		if record.TrashedAt().IsZero() {
++			t.Fatal("expected a non-zero trash timestamp")
++		}
++	})
++
++	t.Run("the record is no longer found", func(t *testing.T) {
++		_, err := app.FindRecordById(posts, record.Id)
++		if !errors.Is(err, sql.ErrNoRows) {
++			t.Fatalf("expected sql.ErrNoRows, got %v", err)
++		}
++	})
++
++	t.Run("the record is found with the trashed ones", func(t *testing.T) {
++		found, err := app.FindRecordByIdWithTrashed(posts, record.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if found.Id != record.Id {
++			t.Fatalf("expected %q, got %q", record.Id, found.Id)
++		}
++
++		if !found.IsTrashed() {
++			t.Fatal("expected the loaded record to be trashed")
++		}
++	})
++
++	t.Run("the record is found by the trashed only lookup", func(t *testing.T) {
++		found, err := app.FindTrashedRecordById(posts, record.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if found.Id != record.Id {
++			t.Fatalf("expected %q, got %q", record.Id, found.Id)
++		}
++	})
++
++	t.Run("listings hide the trashed record", func(t *testing.T) {
++		live, err := app.FindAllRecords(posts)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if len(live) != 0 {
++			t.Fatalf("expected no live records, got %v", sdFindIds(t, live))
++		}
++
++		trashed, err := app.FindAllTrashedRecords(posts)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if len(trashed) != 1 || trashed[0].Id != record.Id {
++			t.Fatalf("expected only %q, got %v", record.Id, sdFindIds(t, trashed))
++		}
++	})
++
++	t.Run("counting hides the trashed record", func(t *testing.T) {
++		total, err := app.CountRecords(posts)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if total != 0 {
++			t.Fatalf("expected 0 records, got %d", total)
++		}
++	})
++
++	t.Run("regular collections still remove the row", func(t *testing.T) {
++		other := sdNewRecord(t, app, plain, map[string]any{"title": "plain"})
++
++		if err := app.Delete(other); err != nil {
++			t.Fatal(err)
++		}
++
++		if sdRawExists(t, app, plain, other.Id) {
++			t.Fatal("expected the record row to be removed")
++		}
++	})
++}
++
++func TestSoftDeleteSecondDeleteIsPermanent(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	record := sdNewRecord(t, app, posts, map[string]any{"title": "twice"})
++
++	if err := app.Delete(record); err != nil {
++		t.Fatal(err)
++	}
++
++	trashed, err := app.FindTrashedRecordById(posts, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.Delete(trashed); err != nil {
++		t.Fatal(err)
++	}
++
++	if sdRawExists(t, app, posts, record.Id) {
++		t.Fatal("expected the trashed record row to be removed")
++	}
++}
++
++func TestSoftDeletePurgeSkipsTheTrash(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	record := sdNewRecord(t, app, posts, map[string]any{"title": "purge me"})
++
++	if err := app.PurgeRecord(record); err != nil {
++		t.Fatal(err)
++	}
++
++	if sdRawExists(t, app, posts, record.Id) {
++		t.Fatal("expected the record row to be removed")
++	}
++}
++
++// -------------------------------------------------------------------
++// trashed records are read-only
++// -------------------------------------------------------------------
++
++func TestSoftDeleteTrashedRecordsCannotBeUpdated(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	record := sdNewRecord(t, app, posts, map[string]any{"title": "locked"})
++
++	if err := app.Delete(record); err != nil {
++		t.Fatal(err)
++	}
++
++	trashed, err := app.FindTrashedRecordById(posts, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	trashed.Set("title", "changed")
++
++	if err := app.Save(trashed); err == nil {
++		t.Fatal("expected an error when updating a trashed record")
++	}
++
++	reloaded, err := app.FindTrashedRecordById(posts, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if reloaded.GetString("title") != "locked" {
++		t.Fatalf("expected the title to be unchanged, got %q", reloaded.GetString("title"))
++	}
++}
++
++// -------------------------------------------------------------------
++// restore
++// -------------------------------------------------------------------
++
++func TestSoftDeleteRestore(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, plain := sdSetup(t, app)
++
++	record := sdNewRecord(t, app, posts, map[string]any{"title": "back"})
++
++	if err := app.Delete(record); err != nil {
++		t.Fatal(err)
++	}
++
++	trashed, err := app.FindTrashedRecordById(posts, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.RestoreRecord(trashed); err != nil {
++		t.Fatal(err)
++	}
++
++	t.Run("the record is visible again", func(t *testing.T) {
++		found, err := app.FindRecordById(posts, record.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if found.IsTrashed() {
++			t.Fatal("expected the restored record to not be trashed")
++		}
++
++		if found.GetString("title") != "back" {
++			t.Fatalf("expected the data to be preserved, got %q", found.GetString("title"))
++		}
++	})
++
++	t.Run("restoring a live record is a no-op", func(t *testing.T) {
++		live, err := app.FindRecordById(posts, record.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if err := app.RestoreRecord(live); err != nil {
++			t.Fatalf("expected no error, got %v", err)
++		}
++	})
++
++	t.Run("restoring is rejected for regular collections", func(t *testing.T) {
++		other := sdNewRecord(t, app, plain, map[string]any{"title": "plain"})
++
++		if err := app.RestoreRecord(other); err == nil {
++			t.Fatal("expected an error for a collection without the soft delete mode")
++		}
++	})
++}
++
++func TestSoftDeleteTrashedUniqueValueIsFreed(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	first := sdNewRecord(t, app, posts, map[string]any{"title": "unique"})
++
++	if err := app.Delete(first); err != nil {
++		t.Fatal(err)
++	}
++
++	// the trashed record must not reserve its unique value anymore
++	second := sdNewRecord(t, app, posts, map[string]any{"title": "unique"})
++
++	t.Run("restoring a conflicting record fails", func(t *testing.T) {
++		trashed, err := app.FindTrashedRecordById(posts, first.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if err := app.RestoreRecord(trashed); err == nil {
++			t.Fatal("expected a unique constraint error")
++		}
++	})
++
++	t.Run("restoring works once the conflict is gone", func(t *testing.T) {
++		if err := app.PurgeRecord(second); err != nil {
++			t.Fatal(err)
++		}
++
++		trashed, err := app.FindTrashedRecordById(posts, first.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if err := app.RestoreRecord(trashed); err != nil {
++			t.Fatal(err)
++		}
++	})
++}
++
++// -------------------------------------------------------------------
++// cascade
++// -------------------------------------------------------------------
++
++func TestSoftDeleteCascadeTrashAndRestore(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "with comments"})
++	c1 := sdNewRecord(t, app, comments, map[string]any{"message": "one", "post": post.Id})
++	c2 := sdNewRecord(t, app, comments, map[string]any{"message": "two", "post": post.Id})
++
++	// trash c2 on its own before the post so that it is not part of the group
++	if err := app.Delete(c2); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.Delete(post); err != nil {
++		t.Fatal(err)
++	}
++
++	t.Run("the cascade comments are trashed as well", func(t *testing.T) {
++		live, err := app.FindAllRecords(comments)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if len(live) != 0 {
++			t.Fatalf("expected no live comments, got %v", sdFindIds(t, live))
++		}
++
++		if !sdRawExists(t, app, comments, c1.Id) {
++			t.Fatal("expected the comment row to be kept")
++		}
++	})
++
++	t.Run("the group shares the trash timestamp", func(t *testing.T) {
++		trashedPost, err := app.FindTrashedRecordById(posts, post.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		trashedComment, err := app.FindTrashedRecordById(comments, c1.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if trashedPost.TrashedAt().String() != trashedComment.TrashedAt().String() {
++			t.Fatalf(
++				"expected an equal trash timestamp, got %q and %q",
++				trashedPost.TrashedAt().String(),
++				trashedComment.TrashedAt().String(),
++			)
++		}
++	})
++
++	t.Run("restoring the post restores only its group", func(t *testing.T) {
++		trashedPost, err := app.FindTrashedRecordById(posts, post.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if err := app.RestoreRecord(trashedPost); err != nil {
++			t.Fatal(err)
++		}
++
++		if _, err := app.FindRecordById(comments, c1.Id); err != nil {
++			t.Fatalf("expected the cascade comment to be restored, got %v", err)
++		}
++
++		if _, err := app.FindRecordById(comments, c2.Id); !errors.Is(err, sql.ErrNoRows) {
++			t.Fatalf("expected the separately trashed comment to stay in the trash, got %v", err)
++		}
++	})
++}
++
++func TestSoftDeletePurgeCascadesPermanently(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "purge cascade"})
++	c1 := sdNewRecord(t, app, comments, map[string]any{"message": "one", "post": post.Id})
++	c2 := sdNewRecord(t, app, comments, map[string]any{"message": "two", "post": post.Id})
++
++	// c2 is already in the trash before the purge
++	if err := app.Delete(c2); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.PurgeRecord(post); err != nil {
++		t.Fatal(err)
++	}
++
++	if sdRawExists(t, app, posts, post.Id) {
++		t.Fatal("expected the post row to be removed")
++	}
++
++	if sdRawExists(t, app, comments, c1.Id) {
++		t.Fatal("expected the live comment row to be removed")
++	}
++
++	if sdRawExists(t, app, comments, c2.Id) {
++		t.Fatal("expected the trashed comment row to be removed")
++	}
++}
++
++// -------------------------------------------------------------------
++// visibility through relations
++// -------------------------------------------------------------------
++
++func TestSoftDeleteRelationVisibility(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	// a relation without cascade so that trashing the post leaves the comment alive
++	comments.Fields.Add(&core.RelationField{
++		Name:         "related",
++		CollectionId: posts.Id,
++	})
++	if err := app.Save(comments); err != nil {
++		t.Fatal(err)
++	}
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "referenced"})
++	comment := sdNewRecord(t, app, comments, map[string]any{"message": "hi", "related": post.Id})
++
++	if err := app.Delete(post); err != nil {
++		t.Fatal(err)
++	}
++
++	t.Run("the referencing record is untouched", func(t *testing.T) {
++		found, err := app.FindRecordById(comments, comment.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if found.GetString("related") != post.Id {
++			t.Fatalf("expected the relation value to be kept, got %q", found.GetString("related"))
++		}
++	})
++
++	t.Run("filtering through the relation finds nothing", func(t *testing.T) {
++		records, err := app.FindRecordsByFilter(comments, "related.title = 'referenced'", "", 0, 0)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if len(records) != 0 {
++			t.Fatalf("expected no matches, got %v", sdFindIds(t, records))
++		}
++	})
++
++	t.Run("expanding the relation returns nothing", func(t *testing.T) {
++		found, err := app.FindRecordById(comments, comment.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		errs := app.ExpandRecord(found, []string{"related"}, nil)
++		if len(errs) > 0 {
++			t.Fatalf("expected no expand errors, got %v", errs)
++		}
++
++		if len(found.Expand()) != 0 {
++			t.Fatalf("expected an empty expand, got %v", found.Expand())
++		}
++	})
++
++	t.Run("filtering works again after a restore", func(t *testing.T) {
++		trashed, err := app.FindTrashedRecordById(posts, post.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if err := app.RestoreRecord(trashed); err != nil {
++			t.Fatal(err)
++		}
++
++		records, err := app.FindRecordsByFilter(comments, "related.title = 'referenced'", "", 0, 0)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if len(records) != 1 || records[0].Id != comment.Id {
++			t.Fatalf("expected only %q, got %v", comment.Id, sdFindIds(t, records))
++		}
++	})
++}
++
++// -------------------------------------------------------------------
++// retention
++// -------------------------------------------------------------------
++
++func TestSoftDeletePurgeTrashedRecords(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, plain := sdSetup(t, app)
++
++	old := sdNewRecord(t, app, posts, map[string]any{"title": "old"})
++	recent := sdNewRecord(t, app, posts, map[string]any{"title": "recent"})
++
++	if err := app.Delete(old); err != nil {
++		t.Fatal(err)
++	}
++	if err := app.Delete(recent); err != nil {
++		t.Fatal(err)
++	}
++
++	// backdate the first record trash timestamp
++	oldTimestamp := types.NowDateTime().Add(-2 * time.Hour)
++	_, err := app.DB().Update(
++		posts.Name,
++		dbx.Params{core.FieldNameDeleted: oldTimestamp.String()},
++		dbx.HashExp{"id": old.Id},
++	).Execute()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	purged, err := app.PurgeTrashedRecords(posts, types.NowDateTime().Add(-1*time.Hour))
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if purged != 1 {
++		t.Fatalf("expected 1 purged record, got %d", purged)
++	}
++
++	if sdRawExists(t, app, posts, old.Id) {
++		t.Fatal("expected the old record row to be removed")
++	}
++
++	if !sdRawExists(t, app, posts, recent.Id) {
++		t.Fatal("expected the recent record row to be kept")
++	}
++
++	if _, err := app.PurgeTrashedRecords(plain, types.NowDateTime()); err == nil {
++		t.Fatal("expected an error for a collection without the soft delete mode")
++	}
++}
++
++func TestSoftDeletePurgeExpiredTrashedRecords(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	posts.TrashRetention = 3600
++	if err := app.Save(posts); err != nil {
++		t.Fatal(err)
++	}
++
++	expired := sdNewRecord(t, app, posts, map[string]any{"title": "expired"})
++	fresh := sdNewRecord(t, app, posts, map[string]any{"title": "fresh"})
++
++	if err := app.Delete(expired); err != nil {
++		t.Fatal(err)
++	}
++	if err := app.Delete(fresh); err != nil {
++		t.Fatal(err)
++	}
++
++	_, err := app.DB().Update(
++		posts.Name,
++		dbx.Params{core.FieldNameDeleted: types.NowDateTime().Add(-2 * time.Hour).String()},
++		dbx.HashExp{"id": expired.Id},
++	).Execute()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.PurgeExpiredTrashedRecords(); err != nil {
++		t.Fatal(err)
++	}
++
++	if sdRawExists(t, app, posts, expired.Id) {
++		t.Fatal("expected the expired record row to be removed")
++	}
++
++	if !sdRawExists(t, app, posts, fresh.Id) {
++		t.Fatal("expected the fresh record row to be kept")
++	}
++}
++
++func TestSoftDeleteSeparateDeletesDoNotShareTimestamp(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	first := sdNewRecord(t, app, posts, map[string]any{"title": "first"})
++	second := sdNewRecord(t, app, posts, map[string]any{"title": "second"})
++
++	if err := app.Delete(first); err != nil {
++		t.Fatal(err)
++	}
++	if err := app.Delete(second); err != nil {
++		t.Fatal(err)
++	}
++
++	if first.TrashedAt().String() == second.TrashedAt().String() {
++		t.Fatalf(
++			"expected two separate deletes to use different trash timestamps, got %q for both",
++			first.TrashedAt().String(),
++		)
++	}
++}
++
++func TestSoftDeleteBackRelationExpand(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "back relations"})
++	live := sdNewRecord(t, app, comments, map[string]any{"message": "live", "post": post.Id})
++	hidden := sdNewRecord(t, app, comments, map[string]any{"message": "hidden", "post": post.Id})
++
++	if err := app.Delete(hidden); err != nil {
++		t.Fatal(err)
++	}
++
++	found, err := app.FindRecordById(posts, post.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	errs := app.ExpandRecord(found, []string{"sd_comments_via_post"}, nil)
++	if len(errs) > 0 {
++		t.Fatalf("expected no expand errors, got %v", errs)
++	}
++
++	expanded, _ := found.Expand()["sd_comments_via_post"].([]*core.Record)
++	if len(expanded) != 1 || expanded[0].Id != live.Id {
++		t.Fatalf("expected only %q, got %v", live.Id, sdFindIds(t, expanded))
++	}
++}
++
++func TestSoftDeleteRestoreRequiresLiveCascadeParent(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "parent"})
++	comment := sdNewRecord(t, app, comments, map[string]any{"message": "child", "post": post.Id})
++
++	if err := app.Delete(post); err != nil {
++		t.Fatal(err)
++	}
++
++	trashedComment, err := app.FindTrashedRecordById(comments, comment.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.RestoreRecord(trashedComment); err == nil {
++		t.Fatal("expected an error when restoring a record whose cascade parent is still trashed")
++	}
++
++	trashedPost, err := app.FindTrashedRecordById(posts, post.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.RestoreRecord(trashedPost); err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := app.FindRecordById(comments, comment.Id); err != nil {
++		t.Fatalf("expected the comment to be restored with its post, got %v", err)
++	}
++}
+diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
+new file mode 100644
+index 0000000..4f7ac2f
+--- /dev/null
++++ b/scripts/junitreport/main.go
+@@ -0,0 +1,238 @@
++// Command junitreport turns the output of "go test -json" into a JUnit XML
++// report. The test output is echoed to stdout unchanged so that the usual
++// go test output is still readable while the report is being written.
++package main
++
++import (
++	"bufio"
++	"encoding/json"
++	"encoding/xml"
++	"flag"
++	"fmt"
++	"os"
++	"sort"
++	"strings"
++)
++
++type testEvent struct {
++	Action  string  `json:"Action"`
++	Package string  `json:"Package"`
++	Test    string  `json:"Test"`
++	Elapsed float64 `json:"Elapsed"`
++	Output  string  `json:"Output"`
++}
++
++type testCase struct {
++	Name    string
++	Package string
++	Action  string
++	Elapsed float64
++	Output  strings.Builder
++	Order   int
++}
++
++type junitFailure struct {
++	XMLName xml.Name `xml:"failure"`
++	Message string   `xml:"message,attr"`
++	Type    string   `xml:"type,attr,omitempty"`
++	Body    string   `xml:",chardata"`
++}
++
++type junitSkipped struct {
++	XMLName xml.Name `xml:"skipped"`
++	Message string   `xml:"message,attr"`
++}
++
++type junitTestCase struct {
++	XMLName   xml.Name      `xml:"testcase"`
++	Name      string        `xml:"name,attr"`
++	ClassName string        `xml:"classname,attr"`
++	Time      string        `xml:"time,attr"`
++	Failure   *junitFailure `xml:"failure,omitempty"`
++	Skipped   *junitSkipped `xml:"skipped,omitempty"`
++	SystemOut string        `xml:"system-out,omitempty"`
++}
++
++type junitTestSuite struct {
++	XMLName   xml.Name        `xml:"testsuite"`
++	Name      string          `xml:"name,attr"`
++	Tests     int             `xml:"tests,attr"`
++	Failures  int             `xml:"failures,attr"`
++	Skipped   int             `xml:"skipped,attr"`
++	Errors    int             `xml:"errors,attr"`
++	Time      string          `xml:"time,attr"`
++	TestCases []junitTestCase `xml:"testcase"`
++}
++
++type junitTestSuites struct {
++	XMLName  xml.Name         `xml:"testsuites"`
++	Tests    int              `xml:"tests,attr"`
++	Failures int              `xml:"failures,attr"`
++	Suites   []junitTestSuite `xml:"testsuite"`
++}
++
++func main() {
++	out := flag.String("out", "", "path to write the JUnit XML report to")
++	flag.Parse()
++
++	cases := map[string]*testCase{}
++	packageOutput := map[string]*strings.Builder{}
++	packageFailed := map[string]bool{}
++	order := 0
++
++	stdout := bufio.NewWriter(os.Stdout)
++	defer stdout.Flush()
++
++	scanner := bufio.NewScanner(os.Stdin)
++	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
++
++	for scanner.Scan() {
++		line := scanner.Bytes()
++
++		var event testEvent
++		if err := json.Unmarshal(line, &event); err != nil {
++			// not a json line, pass it through so nothing is hidden
++			fmt.Fprintln(stdout, string(line))
++			continue
++		}
++
++		if event.Output != "" {
++			fmt.Fprint(stdout, event.Output)
++		}
++
++		if event.Test == "" {
++			if _, seen := packageOutput[event.Package]; !seen {
++				packageOutput[event.Package] = &strings.Builder{}
++			}
++			if event.Output != "" {
++				packageOutput[event.Package].WriteString(event.Output)
++			}
++			if event.Action == "fail" {
++				packageFailed[event.Package] = true
++			}
++			continue
++		}
++
++		key := event.Package + "\x00" + event.Test
++		entry, seen := cases[key]
++		if !seen {
++			entry = &testCase{Name: event.Test, Package: event.Package, Order: order}
++			order++
++			cases[key] = entry
++		}
++
++		if event.Output != "" {
++			entry.Output.WriteString(event.Output)
++		}
++		switch event.Action {
++		case "pass", "fail", "skip":
++			entry.Action = event.Action
++			entry.Elapsed = event.Elapsed
++		}
++	}
++
++	if err := scanner.Err(); err != nil {
++		fmt.Fprintf(os.Stderr, "junitreport: could not read test output: %v\n", err)
++	}
++
++	if *out == "" {
++		return
++	}
++
++	if err := writeReport(*out, cases, packageOutput, packageFailed); err != nil {
++		fmt.Fprintf(os.Stderr, "junitreport: could not write report: %v\n", err)
++	}
++}
++
++func writeReport(path string, cases map[string]*testCase, packageOutput map[string]*strings.Builder, packageFailed map[string]bool) error {
++	byPackage := map[string][]*testCase{}
++	for _, entry := range cases {
++		byPackage[entry.Package] = append(byPackage[entry.Package], entry)
++	}
++
++	// a package that failed without any failing test failed to build or panicked,
++	// so record that as its own test case rather than losing it
++	for pkg, failed := range packageFailed {
++		if !failed {
++			continue
++		}
++		hasFailure := false
++		for _, entry := range byPackage[pkg] {
++			if entry.Action == "fail" {
++				hasFailure = true
++				break
++			}
++		}
++		if hasFailure {
++			continue
++		}
++		synthetic := &testCase{Name: "PackageFailure", Package: pkg, Action: "fail", Order: -1}
++		if builder, ok := packageOutput[pkg]; ok {
++			synthetic.Output.WriteString(builder.String())
++		}
++		byPackage[pkg] = append(byPackage[pkg], synthetic)
++	}
++
++	packages := make([]string, 0, len(byPackage))
++	for pkg := range byPackage {
++		packages = append(packages, pkg)
++	}
++	sort.Strings(packages)
++
++	report := junitTestSuites{}
++	for _, pkg := range packages {
++		entries := byPackage[pkg]
++		sort.Slice(entries, func(i, j int) bool { return entries[i].Order < entries[j].Order })
++
++		suite := junitTestSuite{Name: pkg}
++		total := 0.0
++		for _, entry := range entries {
++			total += entry.Elapsed
++			testcase := junitTestCase{
++				Name:      entry.Name,
++				ClassName: pkg,
++				Time:      fmt.Sprintf("%.3f", entry.Elapsed),
++			}
++			switch entry.Action {
++			case "fail":
++				testcase.Failure = &junitFailure{
++					Message: "Failed",
++					Type:    "go.test.failure",
++					Body:    scrub(entry.Output.String()),
++				}
++				suite.Failures++
++			case "skip":
++				testcase.Skipped = &junitSkipped{Message: "Skipped"}
++				suite.Skipped++
++			default:
++				testcase.SystemOut = scrub(entry.Output.String())
++			}
++			suite.TestCases = append(suite.TestCases, testcase)
++			suite.Tests++
++		}
++		suite.Time = fmt.Sprintf("%.3f", total)
++		report.Tests += suite.Tests
++		report.Failures += suite.Failures
++		report.Suites = append(report.Suites, suite)
++	}
++
++	encoded, err := xml.MarshalIndent(report, "", "  ")
++	if err != nil {
++		return err
++	}
++
++	return os.WriteFile(path, append([]byte(xml.Header), append(encoded, '\n')...), 0644)
++}
++
++// scrub drops the control characters that are not legal in XML character data.
++func scrub(value string) string {
++	return strings.Map(func(r rune) rune {
++		if r == '\t' || r == '\n' || r == '\r' {
++			return r
++		}
++		if r < 0x20 {
++			return -1
++		}
++		return r
++	}, value)
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 0000000..cb2db9c
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,56 @@
++#!/usr/bin/env bash
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++#   base  runs existing suites that must pass both before and after the change.
++#   new   runs the soft delete suites. They fail before the change and pass
++#         after it.
++#
++# A JUnit XML report is written to --output_path when one is given.
++set -uo pipefail
++
++cd "$(dirname "$0")" || exit 2
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  if [ -z "${2:-}" ]; then
++    echo "--output_path needs a value" >&2
++    exit 2
++  fi
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++# every dependency is in the module cache after the image build, so refuse to
++# reach out for anything at test time
++export GOPROXY=off
++export CGO_ENABLED=0
++
++RUN_ARGS=()
++
++case "$MODE" in
++  base)
++    PACKAGES=(./forms/ ./mails/ ./plugins/migratecmd/ ./tools/...)
++    ;;
++  new)
++    PACKAGES=(./core/ ./apis/)
++    RUN_ARGS=(-run '^TestSoftDelete')
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++REPORTER_ARGS=()
++if [ -n "$OUTPUT_PATH" ]; then
++  REPORTER_ARGS=(-out "$OUTPUT_PATH")
++fi
++
++go test -count=1 -json "${RUN_ARGS[@]}" "${PACKAGES[@]}" | go run ./scripts/junitreport "${REPORTER_ARGS[@]}"
++STATUS=${PIPESTATUS[0]}
++
++exit "$STATUS"

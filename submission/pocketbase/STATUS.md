@@ -1,88 +1,66 @@
-# PocketBase submission — in progress
+# PocketBase submission — complete
 
-## Repository
+## Deliverables
 
 | Field | Value |
 | --- | --- |
 | Repository | `https://github.com/pocketbase/pocketbase` |
 | Commit | `5684ee24f1e88f71a2ede73d20cf547fbd509e16` |
-| Commit date | 2026-09-06 |
 | Language | Go |
 | Category | Feature request |
+| Title | Opt-in soft delete with trash and restore for base collections |
+| Task prompt | `task_prompt.md` |
+| Test patch | `test.patch` |
+| Solution patch | `solution.patch` |
+| Dockerfile | `Dockerfile` |
 | Platform check | **eligible · MIT**, no repository reuse warning |
 
-### Why it qualifies (all verified by running the commands)
+## Measured results
 
-- MIT licensed, ~45k stars, commit within days of pinning.
-- **No cgo** — the SQLite driver is the pure Go `modernc.org/sqlite`, so `CGO_ENABLED=0`
-  builds cleanly and there is no system library to install.
-- 19 MB checkout, `go 1.27`.
-- Multi-subsystem, which is what the feature needs: `core` 22,371 non-test LOC,
-  `tools` 17,396, `apis` 8,722, plus `forms`, `migrations`, `plugins`, `cmd`, and
-  `tools/{cron,search,subscriptions,filesystem,auth,hook,router}`.
-- Tests are deterministic and offline: `core`, `forms` and `tools/search` run in 25s
-  with `GOPROXY=off`.
+- **622 meaningful production LOC** added by the solution patch (blank lines,
+  comments, imports, braces and test files excluded).
+- **72 graded test cases** across `core` and `apis`.
+- Verified in a clean checkout of the pinned commit:
+  - test patch only -> `./test.sh base` **passes**, `./test.sh new` **fails**
+  - test + solution -> `./test.sh base` **passes**, `./test.sh new` **passes**
+- Full `go test ./...` after the solution: everything green except
+  `TestRecordAuthWithOAuth2`, which already fails at the pinned commit because
+  it needs outbound network.
 
-## Chosen feature
+## Feature
 
-**Opt-in soft delete with trash and restore for records.**
+Base collections get a `softDelete` option. When it is on, deleting a record
+stamps a `deleted` system field instead of removing the row, the record
+disappears from every read path (queries, finders, list/view endpoints,
+relation and back-relation filters, expand), and it can be restored later.
 
-Verified genuinely absent at this commit — zero files mention soft delete, trash or a
-deleted timestamp, and there is no issue, no pull request and no maintainer decline.
-Already present, and therefore ruled out: rate limiting, MFA, OTP, batch API,
-impersonation, backups.
+The difficulty lives in the interactions:
 
-The codebase has two extension points that make this the natural shape:
+- `RecordQuery` is the base of every read path, so the exclusion has to be
+  correct there and opt-out-able for the trash views.
+- Unique indexes have to become partial while the mode is on and revert exactly
+  when it is off, otherwise a trashed row blocks its own replacement.
+- Trashing cascades through `CascadeDelete` relations and a restore has to
+  bring back exactly that group, which requires the group timestamp to be
+  unique per delete operation.
+- Permanent deletion keeps the existing cascade, including through records that
+  are themselves in the trash.
+- Collections that do not enable the mode must serialize byte-identically to
+  before, which the repository's own `TestCollectionDBExport` enforces.
 
-- `collectionBaseOptions` is an empty struct — a place for base collection options that
-  the maintainers created and never filled.
-- `initDefaultFields()` injects system fields per collection type (`initIdField`,
-  `initPasswordField`, ...), so a `deleted` system field picks up the column creation,
-  the filter/sort resolver and the JSON serialisation that already exist.
+## Files touched by the solution
 
-### Why it is hard
-
-The trash flag has to be honoured by `RecordQuery`, which every read path in the
-codebase is built on: `FindRecordById`, `FindRecordsByFilter`, relation expansion, the
-list endpoint and auth record lookups. Cascade behaviour, unique constraints and
-backwards compatibility for collections that have not enabled the option all have to
-agree. That breadth is the difficulty, and it is also why it cannot be written quickly.
-
-## Status
-
-| Artifact | State |
-| --- | --- |
-| Repository + commit | **done** — eligible on the platform |
-| Dockerfile | **done and verified** (see below) |
-| Title + task prompt | drafted, to be finalised against the tests so the two cannot drift |
-| Test patch | not started |
-| Solution patch | not started |
-
-### Dockerfile verification
-
-Run against a cold module cache:
-
-- `go mod download` + `go mod verify` -> "all modules verified"
-- `go build ./...` -> OK, 75s total, `CGO_ENABLED=0`
-- tests then run with `GOPROXY=off` in 25s, confirming the container works offline
-
-## Next steps
-
-Build in this order, running the suite at each stage:
-
-1. `collectionBaseOptions.SoftDelete` + validation
-2. `initDeletedField()` — the system field carrying the trash timestamp
-3. Delete path: mark instead of remove, plus purge
-4. Query layer: exclude trashed by default
-5. API: restore, purge, include-trashed
-6. Cascade semantics
-
-Meaningful LOC gets measured after step 3 and reported before going further, so the
-600+ requirement is confirmed with a real number rather than an estimate.
+`core/record_trash.go` (new), `core/record_query.go`, `core/collection_model.go`,
+`core/record_model.go`, `core/collection_validate.go`,
+`core/collection_model_base_options.go`, `core/record_field_resolver.go`,
+`core/record_query_expand.go`, `core/app.go`, `core/base.go`, `core/field.go`,
+`apis/record_crud.go`, `apis/realtime.go`, `apis/batch.go`,
+`forms/record_upsert.go`, `plugins/jsvm/binds_test.go`.
 
 ## Sibling directory
 
-`../rejected-yq-plist/` holds the earlier yq property list submission. It passed every
-precheck but was **rejected at the Scope Gate as publicly-solved**: `DHowett/go-plist`
-implements the same XML and binary codec and would have covered 14 of 21 graded tests.
-Kept as a record of what the gate rejects and why.
+`../rejected-yq-plist/` holds the earlier yq property list submission. It passed
+every precheck but was **rejected at the Scope Gate as publicly-solved**:
+`DHowett/go-plist` implements the same codec. Kept as a record of what the gate
+rejects and why. This feature has no such public equivalent — the hard part is
+PocketBase's own collection, record, query and cascade machinery.
