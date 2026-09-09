@@ -27,7 +27,7 @@ Everything in this folder is ready to paste into the submission form.
 
 ## 3. Task prompt
 
-See [`task_prompt.md`](./task_prompt.md). 315 words, plain prose, no URLs, pure ASCII.
+See [`task_prompt.md`](./task_prompt.md). 319 words, plain prose, no URLs, pure ASCII.
 
 ## 4. Dockerfile
 
@@ -42,7 +42,7 @@ See [`test.patch`](./test.patch). It adds three files and touches no production 
 | File | Purpose |
 | --- | --- |
 | `test.sh` | the `base` / `new` harness |
-| `test/formats/property_list_test.go` | 34 hidden tests |
+| `test/formats/property_list_test.go` | 35 hidden tests |
 | `scripts/junitreport/main.go` | converts `go test -json` into JUnit XML |
 
 The tests live in their own package (`test/formats`) so that `base` can run every existing suite
@@ -85,14 +85,14 @@ Every result below was produced by actually running the commands.
 
 | State | `base` | `new` |
 | --- | --- | --- |
-| clean checkout + `test.patch` | **PASS** — 496 tests, 0 failures | **FAIL** — 34 tests, 34 failures |
-| clean checkout + `test.patch` + `solution.patch` | **PASS** — 496 tests, 0 failures | **PASS** — 34 tests, 0 failures |
+| clean checkout + `test.patch` | **PASS** — 496 tests, 0 failures | **FAIL** — 35 tests, 35 failures |
+| clean checkout + `test.patch` + `solution.patch` | **PASS** — 496 tests, 0 failures | **PASS** — 35 tests, 0 failures |
 
-All 34 new tests fail on the base commit and all 34 pass with the solution.
+All 35 new tests fail on the base commit and all 35 pass with the solution.
 
 ### Determinism
 
-- `new` run six times without the solution: 34 failures every run.
+- `new` run six times without the solution: 35 failures every run.
 - `new` run six times with the solution: exit 0 every run.
 - `base` run three times in both states: exit 0 every run.
 - `go test -race ./test/formats/...`: clean.
@@ -135,3 +135,51 @@ phase is enough for both test modes to then run with `GOPROXY=off`, i.e. with no
    agent has attempted this yet. Run a **Quick Check** before committing to a full batch: if it
    comes back solved easily the task is too easy, and if it comes back blocked on something
    ambiguous rather than something hard, the prompt needs a sentence.
+
+## 9. Precheck results
+
+Run on 2026-09-09. Everything passed; three warnings came back and all three have
+been addressed.
+
+| Group | Result |
+| --- | --- |
+| GitHub Repository | 1/1 |
+| Problem Description & Tests | 12/12 |
+| Plagiarism Review | 1/1 — not a duplicate |
+| Dockerfile | 2/2 |
+| Solution Patch | 1/1 |
+
+The repository carries a "used in 39 submissions by 12 other contributors" notice, but
+the plagiarism and duplicate checks came back clean, which is the check that actually
+decides novelty.
+
+### Warnings and what was done
+
+1. **Dockerfile — "version pinning cannot be verified."** yq does commit both `go.mod`
+   and a 90 line `go.sum`, and there is no vendor directory, so the dependencies were
+   already pinned; the checker simply could not confirm that from the Dockerfile alone.
+   Added an explicit `RUN go mod verify`, which checks every downloaded module against
+   the committed hashes and fails the build on a mismatch. Verified locally against a
+   cold module cache: "all modules verified".
+
+2. **Description — "contains only necessary information."** Both suggestions taken.
+   Dropped "both usable for input and for output" (the following sentence already covers
+   reading with either name, and the third paragraph already covers writing with each)
+   and dropped the filler "on its own".
+
+3. **Problem and tests — coverage gap and over-specification.** Both taken.
+   - Added `TestPropertyListNamesAcceptEitherFlavour`, which reads an XML document
+     through the `bplist` name and a binary document through the `plist` name. This was
+     a real gap: the old suite only proved binary could be read through either name.
+   - The exact-output tests pin dictionary key order, which the description had not
+     stated. Rather than weaken the tests, the requirement is now stated: dictionary
+     entries are written "in the order they are held rather than sorted". yq is
+     order-preserving throughout, so this is the repo's own behaviour, and an
+     implementation that sorts keys is now failing a stated requirement rather than an
+     unstated one.
+   - Also replaced "reads back unchanged" with "reads back with the same values" to
+     settle the byte-identical versus value-identical ambiguity the reviewer raised.
+     The tests check values, not bytes, so that no particular binary object layout is
+     forced on the solver.
+
+`solution.patch` was not touched by any of this, so the meaningful LOC count is still 764.

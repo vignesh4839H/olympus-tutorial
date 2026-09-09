@@ -304,10 +304,10 @@ index 00000000..f6124972
 +exit "$STATUS"
 diff --git a/test/formats/property_list_test.go b/test/formats/property_list_test.go
 new file mode 100644
-index 00000000..dcb7dbd6
+index 00000000..4fc206f8
 --- /dev/null
 +++ b/test/formats/property_list_test.go
-@@ -0,0 +1,597 @@
+@@ -0,0 +1,610 @@
 +package formats
 +
 +import (
@@ -555,6 +555,19 @@ index 00000000..dcb7dbd6
 +	if got := yqlib.FormatStringFromFilename("Info.plist"); got != "plist" {
 +		t.Errorf("expected a .plist file to be read as plist, got %v", got)
 +	}
++}
++
++// Either name reads either flavour, because a file on disk may hold either.
++func TestPropertyListNamesAcceptEitherFlavour(t *testing.T) {
++	throughBinaryName := mustDecode(t, "bplist", []byte(kitchenSinkXML))
++	expectScalar(t, entry(t, throughBinaryName, "name"), "!!str", "com.example.agent")
++	expectScalar(t, entry(t, throughBinaryName, "retries"), "!!int", "3")
++	expectScalar(t, entry(t, throughBinaryName, "enabled"), "!!bool", "true")
++
++	throughXMLName := mustDecode(t, "plist", fixture(t, binaryKitchenSink))
++	expectScalar(t, entry(t, throughXMLName, "name"), "!!str", "com.example.agent")
++	expectScalar(t, entry(t, throughXMLName, "tiny"), "!!int", "7")
++	expectScalar(t, entry(t, throughXMLName, "unicode"), "!!str", "héllo 世界")
 +}
 +
 +func TestPropertyListDecodesXMLScalars(t *testing.T) {
