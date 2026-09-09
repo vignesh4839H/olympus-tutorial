@@ -1,0 +1,907 @@
+diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
+new file mode 100644
+index 00000000..4f7ac2fa
+--- /dev/null
++++ b/scripts/junitreport/main.go
+@@ -0,0 +1,238 @@
++// Command junitreport turns the output of "go test -json" into a JUnit XML
++// report. The test output is echoed to stdout unchanged so that the usual
++// go test output is still readable while the report is being written.
++package main
++
++import (
++	"bufio"
++	"encoding/json"
++	"encoding/xml"
++	"flag"
++	"fmt"
++	"os"
++	"sort"
++	"strings"
++)
++
++type testEvent struct {
++	Action  string  `json:"Action"`
++	Package string  `json:"Package"`
++	Test    string  `json:"Test"`
++	Elapsed float64 `json:"Elapsed"`
++	Output  string  `json:"Output"`
++}
++
++type testCase struct {
++	Name    string
++	Package string
++	Action  string
++	Elapsed float64
++	Output  strings.Builder
++	Order   int
++}
++
++type junitFailure struct {
++	XMLName xml.Name `xml:"failure"`
++	Message string   `xml:"message,attr"`
++	Type    string   `xml:"type,attr,omitempty"`
++	Body    string   `xml:",chardata"`
++}
++
++type junitSkipped struct {
++	XMLName xml.Name `xml:"skipped"`
++	Message string   `xml:"message,attr"`
++}
++
++type junitTestCase struct {
++	XMLName   xml.Name      `xml:"testcase"`
++	Name      string        `xml:"name,attr"`
++	ClassName string        `xml:"classname,attr"`
++	Time      string        `xml:"time,attr"`
++	Failure   *junitFailure `xml:"failure,omitempty"`
++	Skipped   *junitSkipped `xml:"skipped,omitempty"`
++	SystemOut string        `xml:"system-out,omitempty"`
++}
++
++type junitTestSuite struct {
++	XMLName   xml.Name        `xml:"testsuite"`
++	Name      string          `xml:"name,attr"`
++	Tests     int             `xml:"tests,attr"`
++	Failures  int             `xml:"failures,attr"`
++	Skipped   int             `xml:"skipped,attr"`
++	Errors    int             `xml:"errors,attr"`
++	Time      string          `xml:"time,attr"`
++	TestCases []junitTestCase `xml:"testcase"`
++}
++
++type junitTestSuites struct {
++	XMLName  xml.Name         `xml:"testsuites"`
++	Tests    int              `xml:"tests,attr"`
++	Failures int              `xml:"failures,attr"`
++	Suites   []junitTestSuite `xml:"testsuite"`
++}
++
++func main() {
++	out := flag.String("out", "", "path to write the JUnit XML report to")
++	flag.Parse()
++
++	cases := map[string]*testCase{}
++	packageOutput := map[string]*strings.Builder{}
++	packageFailed := map[string]bool{}
++	order := 0
++
++	stdout := bufio.NewWriter(os.Stdout)
++	defer stdout.Flush()
++
++	scanner := bufio.NewScanner(os.Stdin)
++	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
++
++	for scanner.Scan() {
++		line := scanner.Bytes()
++
++		var event testEvent
++		if err := json.Unmarshal(line, &event); err != nil {
++			// not a json line, pass it through so nothing is hidden
++			fmt.Fprintln(stdout, string(line))
++			continue
++		}
++
++		if event.Output != "" {
++			fmt.Fprint(stdout, event.Output)
++		}
++
++		if event.Test == "" {
++			if _, seen := packageOutput[event.Package]; !seen {
++				packageOutput[event.Package] = &strings.Builder{}
++			}
++			if event.Output != "" {
++				packageOutput[event.Package].WriteString(event.Output)
++			}
++			if event.Action == "fail" {
++				packageFailed[event.Package] = true
++			}
++			continue
++		}
++
++		key := event.Package + "\x00" + event.Test
++		entry, seen := cases[key]
++		if !seen {
++			entry = &testCase{Name: event.Test, Package: event.Package, Order: order}
++			order++
++			cases[key] = entry
++		}
++
++		if event.Output != "" {
++			entry.Output.WriteString(event.Output)
++		}
++		switch event.Action {
++		case "pass", "fail", "skip":
++			entry.Action = event.Action
++			entry.Elapsed = event.Elapsed
++		}
++	}
++
++	if err := scanner.Err(); err != nil {
++		fmt.Fprintf(os.Stderr, "junitreport: could not read test output: %v\n", err)
++	}
++
++	if *out == "" {
++		return
++	}
++
++	if err := writeReport(*out, cases, packageOutput, packageFailed); err != nil {
++		fmt.Fprintf(os.Stderr, "junitreport: could not write report: %v\n", err)
++	}
++}
++
++func writeReport(path string, cases map[string]*testCase, packageOutput map[string]*strings.Builder, packageFailed map[string]bool) error {
++	byPackage := map[string][]*testCase{}
++	for _, entry := range cases {
++		byPackage[entry.Package] = append(byPackage[entry.Package], entry)
++	}
++
++	// a package that failed without any failing test failed to build or panicked,
++	// so record that as its own test case rather than losing it
++	for pkg, failed := range packageFailed {
++		if !failed {
++			continue
++		}
++		hasFailure := false
++		for _, entry := range byPackage[pkg] {
++			if entry.Action == "fail" {
++				hasFailure = true
++				break
++			}
++		}
++		if hasFailure {
++			continue
++		}
++		synthetic := &testCase{Name: "PackageFailure", Package: pkg, Action: "fail", Order: -1}
++		if builder, ok := packageOutput[pkg]; ok {
++			synthetic.Output.WriteString(builder.String())
++		}
++		byPackage[pkg] = append(byPackage[pkg], synthetic)
++	}
++
++	packages := make([]string, 0, len(byPackage))
++	for pkg := range byPackage {
++		packages = append(packages, pkg)
++	}
++	sort.Strings(packages)
++
++	report := junitTestSuites{}
++	for _, pkg := range packages {
++		entries := byPackage[pkg]
++		sort.Slice(entries, func(i, j int) bool { return entries[i].Order < entries[j].Order })
++
++		suite := junitTestSuite{Name: pkg}
++		total := 0.0
++		for _, entry := range entries {
++			total += entry.Elapsed
++			testcase := junitTestCase{
++				Name:      entry.Name,
++				ClassName: pkg,
++				Time:      fmt.Sprintf("%.3f", entry.Elapsed),
++			}
++			switch entry.Action {
++			case "fail":
++				testcase.Failure = &junitFailure{
++					Message: "Failed",
++					Type:    "go.test.failure",
++					Body:    scrub(entry.Output.String()),
++				}
++				suite.Failures++
++			case "skip":
++				testcase.Skipped = &junitSkipped{Message: "Skipped"}
++				suite.Skipped++
++			default:
++				testcase.SystemOut = scrub(entry.Output.String())
++			}
++			suite.TestCases = append(suite.TestCases, testcase)
++			suite.Tests++
++		}
++		suite.Time = fmt.Sprintf("%.3f", total)
++		report.Tests += suite.Tests
++		report.Failures += suite.Failures
++		report.Suites = append(report.Suites, suite)
++	}
++
++	encoded, err := xml.MarshalIndent(report, "", "  ")
++	if err != nil {
++		return err
++	}
++
++	return os.WriteFile(path, append([]byte(xml.Header), append(encoded, '\n')...), 0644)
++}
++
++// scrub drops the control characters that are not legal in XML character data.
++func scrub(value string) string {
++	return strings.Map(func(r rune) rune {
++		if r == '\t' || r == '\n' || r == '\r' {
++			return r
++		}
++		if r < 0x20 {
++			return -1
++		}
++		return r
++	}, value)
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..f6124972
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,54 @@
++#!/usr/bin/env bash
++#
++# Usage:
++#   ./test.sh [--output_path <junit.xml>] <base|new>
++#
++#   base  run the existing test suites that cover the areas this change touches.
++#         These must pass before and after the change.
++#   new   run the property list format tests. These fail before the change and
++#         pass after it.
++#
++# A JUnit XML report is written to --output_path when one is given.
++set -uo pipefail
++
++cd "$(dirname "$0")" || exit 2
++
++OUTPUT_PATH=""
++if [ "${1:-}" = "--output_path" ]; then
++  if [ -z "${2:-}" ]; then
++    echo "--output_path needs a value" >&2
++    exit 2
++  fi
++  OUTPUT_PATH="$2"
++  shift 2
++fi
++
++MODE="${1:-new}"
++
++# Everything needed is vendored into the module cache at build time, so refuse
++# to reach out for anything at test time.
++export GOPROXY=off
++
++case "$MODE" in
++  base)
++    # every package that holds existing tests, except the property list suite
++    PACKAGES=(. ./cmd/... ./pkg/... ./test)
++    ;;
++  new)
++    PACKAGES=(./test/formats/...)
++    ;;
++  *)
++    echo "unknown mode: $MODE (expected base or new)" >&2
++    exit 2
++    ;;
++esac
++
++REPORTER_ARGS=()
++if [ -n "$OUTPUT_PATH" ]; then
++  REPORTER_ARGS=(-out "$OUTPUT_PATH")
++fi
++
++go test -count=1 -json "${PACKAGES[@]}" | go run ./scripts/junitreport "${REPORTER_ARGS[@]}"
++STATUS=${PIPESTATUS[0]}
++
++exit "$STATUS"
+diff --git a/test/formats/property_list_test.go b/test/formats/property_list_test.go
+new file mode 100644
+index 00000000..dcb7dbd6
+--- /dev/null
++++ b/test/formats/property_list_test.go
+@@ -0,0 +1,597 @@
++package formats
++
++import (
++	"bytes"
++	"encoding/base64"
++	"encoding/binary"
++	"io"
++	"strconv"
++	"strings"
++	"testing"
++
++	"github.com/mikefarah/yq/v4/pkg/yqlib"
++)
++
++const xmlHeader = `<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++`
++
++const kitchenSinkXML = xmlHeader + `<dict>
++	<key>name</key>
++	<string>com.example.agent</string>
++	<key>enabled</key>
++	<true/>
++	<key>disabled</key>
++	<false/>
++	<key>retries</key>
++	<integer>3</integer>
++	<key>negative</key>
++	<integer>-42</integer>
++	<key>ratio</key>
++	<real>0.5</real>
++	<key>blob</key>
++	<data>aGVsbG8=</data>
++	<key>when</key>
++	<date>2024-01-02T03:04:05Z</date>
++</dict>
++</plist>
++`
++
++// binaryKitchenSink: 260 bytes
++const binaryKitchenSink = "" +
++	"YnBsaXN0MDDcAQIDBAUGBwgJCgsMDQ4PEBESExQVFhcYVGJsb2JYZGlzYWJsZWRXZW5hYmxlZFVsYXJnZVZtZWRpdW1U" +
++	"bmFtZVhuZWdhdGl2ZVVyYXRpb1VzbWFsbFR0aW55V3VuaWNvZGVUd2hlbkVoZWxsbwgJEwAAAQAAAAAAEgABEXBfEBFj" +
++	"b20uZXhhbXBsZS5hZ2VudBP/////////1iM/4AAAAAAAABEBLBAHaABoAOkAbABsAG8AIE4WdUwzQcWh2lKAAAAIISYv" +
++	"Nz1ESVJYXmNrcHZ3eIGGmqOsr7HCAAAAAAAAAQEAAAAAAAAAGQAAAAAAAAAAAAAAAAAAAMs="
++
++// binaryNested: 115 bytes
++const binaryNested = "" +
++	"YnBsaXN0MDDTAQIDBAUGWWVtcHR5RGljdFllbXB0eUxpc3RUbGlzdNCgpQcICQoNUWEQAQmiCwwQAhAD0Q4PUWtRdggP" +
++	"GSMoKSowMjQ1ODo8P0EAAAAAAAABAQAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAQw=="
++
++// binaryLongCount: 244 bytes, twenty entries, so the dictionary size does not
++// fit in the object marker
++const binaryLongCount = "" +
++	"YnBsaXN0MDDfEBQBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fICEiIyQlJicoU2swMFNrMDFTazAyU2swM1Nr" +
++	"MDRTazA1U2swNlNrMDdTazA4U2swOVNrMTBTazExU2sxMlNrMTNTazE0U2sxNVNrMTZTazE3U2sxOFNrMTkQABABEAIQ" +
++	"AxAEEAUQBhAHEAgQCRAKEAsQDBANEA4QDxAQEBEQEhATCDM3Oz9DR0tPU1dbX2Nna29zd3t/g4WHiYuNj5GTlZeZm52f" +
++	"oaOlp6kAAAAAAAABAQAAAAAAAAApAAAAAAAAAAAAAAAAAAAAqw=="
++
++func formatByName(t *testing.T, name string) *yqlib.Format {
++	t.Helper()
++	format, err := yqlib.FormatFromString(name)
++	if err != nil {
++		t.Fatalf("format %v is not available: %v", name, err)
++	}
++	return format
++}
++
++func decodeWith(t *testing.T, name string, input []byte) (*yqlib.CandidateNode, error) {
++	t.Helper()
++	decoder := formatByName(t, name).DecoderFactory()
++	if decoder == nil {
++		t.Fatalf("format %v has no decoder", name)
++	}
++	if err := decoder.Init(bytes.NewReader(input)); err != nil {
++		return nil, err
++	}
++	return decoder.Decode()
++}
++
++func mustDecode(t *testing.T, name string, input []byte) *yqlib.CandidateNode {
++	t.Helper()
++	node, err := decodeWith(t, name, input)
++	if err != nil {
++		t.Fatalf("could not decode %v: %v", name, err)
++	}
++	return node
++}
++
++func encodeWith(t *testing.T, name string, node *yqlib.CandidateNode) ([]byte, error) {
++	t.Helper()
++	encoder := formatByName(t, name).GetConfiguredEncoder()
++	if encoder == nil {
++		t.Fatalf("format %v has no encoder", name)
++	}
++	var out bytes.Buffer
++	if err := encoder.Encode(&out, node); err != nil {
++		return nil, err
++	}
++	return out.Bytes(), nil
++}
++
++func mustEncode(t *testing.T, name string, node *yqlib.CandidateNode) []byte {
++	t.Helper()
++	out, err := encodeWith(t, name, node)
++	if err != nil {
++		t.Fatalf("could not encode %v: %v", name, err)
++	}
++	return out
++}
++
++func parseYAML(t *testing.T, document string) *yqlib.CandidateNode {
++	t.Helper()
++	decoder := formatByName(t, "yaml").DecoderFactory()
++	if err := decoder.Init(strings.NewReader(document)); err != nil {
++		t.Fatalf("could not read yaml: %v", err)
++	}
++	node, err := decoder.Decode()
++	if err != nil {
++		t.Fatalf("could not read yaml: %v", err)
++	}
++	return node
++}
++
++func fixture(t *testing.T, encoded string) []byte {
++	t.Helper()
++	raw, err := base64.StdEncoding.DecodeString(encoded)
++	if err != nil {
++		t.Fatalf("bad fixture: %v", err)
++	}
++	return raw
++}
++
++// entry looks a key up in a mapping node.
++func entry(t *testing.T, node *yqlib.CandidateNode, key string) *yqlib.CandidateNode {
++	t.Helper()
++	if node.Kind != yqlib.MappingNode {
++		t.Fatalf("expected a mapping, got kind %v", node.Kind)
++	}
++	for index := 0; index+1 < len(node.Content); index += 2 {
++		if node.Content[index].Value == key {
++			return node.Content[index+1]
++		}
++	}
++	t.Fatalf("mapping has no key %v", key)
++	return nil
++}
++
++func expectScalar(t *testing.T, node *yqlib.CandidateNode, tag string, value string) {
++	t.Helper()
++	if node.Kind != yqlib.ScalarNode {
++		t.Fatalf("expected a scalar, got kind %v", node.Kind)
++	}
++	if node.Tag != tag {
++		t.Errorf("expected tag %v, got %v (value %v)", tag, node.Tag, node.Value)
++	}
++	if node.Value != value {
++		t.Errorf("expected value %v, got %v", value, node.Value)
++	}
++}
++
++// expectFloat compares the number a scalar holds rather than how it was
++// written, so that any exact spelling of the value is accepted.
++func expectFloat(t *testing.T, node *yqlib.CandidateNode, value float64) {
++	t.Helper()
++	if node.Kind != yqlib.ScalarNode {
++		t.Fatalf("expected a scalar, got kind %v", node.Kind)
++	}
++	if node.Tag != "!!float" {
++		t.Errorf("expected tag !!float, got %v (value %v)", node.Tag, node.Value)
++	}
++	got, err := strconv.ParseFloat(node.Value, 64)
++	if err != nil {
++		t.Fatalf("%v is not a number: %v", node.Value, err)
++	}
++	if got != value {
++		t.Errorf("expected %v, got %v", value, got)
++	}
++}
++
++func expectKind(t *testing.T, node *yqlib.CandidateNode, kind yqlib.Kind, children int) {
++	t.Helper()
++	if node.Kind != kind {
++		t.Fatalf("expected kind %v, got %v", kind, node.Kind)
++	}
++	if len(node.Content) != children {
++		t.Fatalf("expected %v children, got %v", children, len(node.Content))
++	}
++}
++
++// expectBinaryPlistShape checks the envelope of a binary property list without
++// assuming any particular object layout.
++func expectBinaryPlistShape(t *testing.T, raw []byte) {
++	t.Helper()
++	if !bytes.HasPrefix(raw, []byte("bplist")) {
++		t.Fatalf("output is not a binary property list, starts with %q", raw[:min(8, len(raw))])
++	}
++	if len(raw) < 40 {
++		t.Fatalf("binary property list is too short: %v bytes", len(raw))
++	}
++
++	trailer := raw[len(raw)-32:]
++	offsetSize := uint64(trailer[6])
++	refSize := uint64(trailer[7])
++	numObjects := binary.BigEndian.Uint64(trailer[8:16])
++	topObject := binary.BigEndian.Uint64(trailer[16:24])
++	offsetTableOffset := binary.BigEndian.Uint64(trailer[24:32])
++
++	if offsetSize < 1 || offsetSize > 8 {
++		t.Errorf("offset size %v is not usable", offsetSize)
++	}
++	if refSize < 1 || refSize > 8 {
++		t.Errorf("object reference size %v is not usable", refSize)
++	}
++	if numObjects == 0 {
++		t.Fatal("binary property list holds no objects")
++	}
++	if topObject >= numObjects {
++		t.Errorf("root object %v is not one of the %v objects", topObject, numObjects)
++	}
++	if offsetTableOffset+numObjects*offsetSize > uint64(len(raw)-32) {
++		t.Errorf("offset table does not fit in the document")
++	}
++}
++
++func min(a int, b int) int {
++	if a < b {
++		return a
++	}
++	return b
++}
++
++func TestPropertyListFormatsAreRegistered(t *testing.T) {
++	for _, name := range []string{"plist", "bplist"} {
++		format := formatByName(t, name)
++		if format.EncoderFactory == nil {
++			t.Errorf("%v cannot be used as an output format", name)
++		}
++		if format.DecoderFactory == nil {
++			t.Errorf("%v cannot be used as an input format", name)
++		}
++	}
++
++	if got := yqlib.FormatStringFromFilename("Info.plist"); got != "plist" {
++		t.Errorf("expected a .plist file to be read as plist, got %v", got)
++	}
++}
++
++func TestPropertyListDecodesXMLScalars(t *testing.T) {
++	node := mustDecode(t, "plist", []byte(kitchenSinkXML))
++	expectKind(t, node, yqlib.MappingNode, 16)
++
++	expectScalar(t, entry(t, node, "name"), "!!str", "com.example.agent")
++	expectScalar(t, entry(t, node, "enabled"), "!!bool", "true")
++	expectScalar(t, entry(t, node, "disabled"), "!!bool", "false")
++	expectScalar(t, entry(t, node, "retries"), "!!int", "3")
++	expectScalar(t, entry(t, node, "negative"), "!!int", "-42")
++	expectFloat(t, entry(t, node, "ratio"), 0.5)
++	expectScalar(t, entry(t, node, "blob"), "!!binary", "aGVsbG8=")
++	expectScalar(t, entry(t, node, "when"), "!!timestamp", "2024-01-02T03:04:05Z")
++}
++
++func TestPropertyListDecodesXMLContainers(t *testing.T) {
++	document := xmlHeader + `<dict>
++	<key>list</key>
++	<array>
++		<string>a</string>
++		<integer>1</integer>
++		<array>
++			<string>deep</string>
++		</array>
++	</array>
++	<key>emptyDict</key>
++	<dict/>
++	<key>emptyList</key>
++	<array/>
++	<key>nested</key>
++	<dict>
++		<key>inner</key>
++		<string>value</string>
++	</dict>
++</dict>
++</plist>
++`
++	node := mustDecode(t, "plist", []byte(document))
++
++	list := entry(t, node, "list")
++	expectKind(t, list, yqlib.SequenceNode, 3)
++	expectScalar(t, list.Content[0], "!!str", "a")
++	expectScalar(t, list.Content[1], "!!int", "1")
++	expectKind(t, list.Content[2], yqlib.SequenceNode, 1)
++	expectScalar(t, list.Content[2].Content[0], "!!str", "deep")
++
++	expectKind(t, entry(t, node, "emptyDict"), yqlib.MappingNode, 0)
++	expectKind(t, entry(t, node, "emptyList"), yqlib.SequenceNode, 0)
++
++	nested := entry(t, node, "nested")
++	expectKind(t, nested, yqlib.MappingNode, 2)
++	expectScalar(t, entry(t, nested, "inner"), "!!str", "value")
++}
++
++func TestPropertyListDecodesXMLWithoutWrapper(t *testing.T) {
++	node := mustDecode(t, "plist", []byte(`<string>bare</string>`))
++	expectScalar(t, node, "!!str", "bare")
++}
++
++func TestPropertyListDecodesXMLEntities(t *testing.T) {
++	node := mustDecode(t, "plist", []byte(xmlHeader+`<dict>
++	<key>a&amp;b</key>
++	<string>x &lt; y &amp; z</string>
++</dict>
++</plist>
++`))
++	expectScalar(t, entry(t, node, "a&b"), "!!str", "x < y & z")
++}
++
++func TestPropertyListReportsOneDocumentOnly(t *testing.T) {
++	decoder := formatByName(t, "plist").DecoderFactory()
++	if err := decoder.Init(strings.NewReader(kitchenSinkXML)); err != nil {
++		t.Fatal(err)
++	}
++	if _, err := decoder.Decode(); err != nil {
++		t.Fatalf("first read failed: %v", err)
++	}
++	if _, err := decoder.Decode(); err != io.EOF {
++		t.Errorf("expected EOF after the only value, got %v", err)
++	}
++}
++
++func TestPropertyListRejectsBadXML(t *testing.T) {
++	cases := map[string]string{
++		"value without a key":  xmlHeader + `<dict><string>x</string></dict></plist>`,
++		"key without a value":  xmlHeader + `<dict><key>a</key></dict></plist>`,
++		"unknown element":      xmlHeader + `<banana/></plist>`,
++		"integer not a number": xmlHeader + `<integer>abc</integer></plist>`,
++		"real not a number":    xmlHeader + `<real>abc</real></plist>`,
++		"two root values":      xmlHeader + `<string>a</string><string>b</string></plist>`,
++		"unclosed element":     xmlHeader + `<dict><key>a</key><string>x`,
++		"element in a string":  xmlHeader + `<string><integer>1</integer></string></plist>`,
++	}
++
++	for name, document := range cases {
++		t.Run(name, func(t *testing.T) {
++			if _, err := decodeWith(t, "plist", []byte(document)); err == nil {
++				t.Error("expected an error, got none")
++			}
++		})
++	}
++}
++
++func TestPropertyListEncodesXMLDocument(t *testing.T) {
++	node := parseYAML(t, `name: com.example.agent
++enabled: true
++disabled: false
++retries: 3
++negative: -42
++ratio: 0.5
++`)
++	expected := xmlHeader + `<dict>
++	<key>name</key>
++	<string>com.example.agent</string>
++	<key>enabled</key>
++	<true/>
++	<key>disabled</key>
++	<false/>
++	<key>retries</key>
++	<integer>3</integer>
++	<key>negative</key>
++	<integer>-42</integer>
++	<key>ratio</key>
++	<real>0.5</real>
++</dict>
++</plist>
++`
++	if got := string(mustEncode(t, "plist", node)); got != expected {
++		t.Errorf("unexpected property list.\n--- expected ---\n%v\n--- got ---\n%v", expected, got)
++	}
++}
++
++func TestPropertyListEncodesNestedXML(t *testing.T) {
++	node := parseYAML(t, `outer:
++  items:
++    - one
++    - nested: {}
++  empty: []
++`)
++	expected := xmlHeader + `<dict>
++	<key>outer</key>
++	<dict>
++		<key>items</key>
++		<array>
++			<string>one</string>
++			<dict>
++				<key>nested</key>
++				<dict/>
++			</dict>
++		</array>
++		<key>empty</key>
++		<array/>
++	</dict>
++</dict>
++</plist>
++`
++	if got := string(mustEncode(t, "plist", node)); got != expected {
++		t.Errorf("unexpected property list.\n--- expected ---\n%v\n--- got ---\n%v", expected, got)
++	}
++}
++
++func TestPropertyListEscapesXMLText(t *testing.T) {
++	node := parseYAML(t, `"a<b": "x & y > z"`)
++	encoded := string(mustEncode(t, "plist", node))
++
++	if !strings.Contains(encoded, "<key>a&lt;b</key>") {
++		t.Errorf("key was not escaped: %v", encoded)
++	}
++	if !strings.Contains(encoded, "<string>x &amp; y &gt; z</string>") {
++		t.Errorf("value was not escaped: %v", encoded)
++	}
++}
++
++func TestPropertyListRoundTripsXML(t *testing.T) {
++	node := mustDecode(t, "plist", []byte(kitchenSinkXML))
++	if got := string(mustEncode(t, "plist", node)); got != kitchenSinkXML {
++		t.Errorf("round trip changed the document.\n--- expected ---\n%v\n--- got ---\n%v", kitchenSinkXML, got)
++	}
++}
++
++func TestPropertyListEncodersRejectNull(t *testing.T) {
++	node := parseYAML(t, "missing: ~\n")
++	for _, name := range []string{"plist", "bplist"} {
++		t.Run(name, func(t *testing.T) {
++			if _, err := encodeWith(t, name, node); err == nil {
++				t.Error("expected null to be rejected, got no error")
++			}
++		})
++	}
++}
++
++func TestPropertyListDecodesBinaryScalars(t *testing.T) {
++	node := mustDecode(t, "plist", fixture(t, binaryKitchenSink))
++
++	expectScalar(t, entry(t, node, "name"), "!!str", "com.example.agent")
++	expectScalar(t, entry(t, node, "enabled"), "!!bool", "true")
++	expectScalar(t, entry(t, node, "disabled"), "!!bool", "false")
++	expectScalar(t, entry(t, node, "tiny"), "!!int", "7")
++	expectScalar(t, entry(t, node, "small"), "!!int", "300")
++	expectScalar(t, entry(t, node, "medium"), "!!int", "70000")
++	expectScalar(t, entry(t, node, "large"), "!!int", "1099511627776")
++	expectScalar(t, entry(t, node, "negative"), "!!int", "-42")
++	expectFloat(t, entry(t, node, "ratio"), 0.5)
++	expectScalar(t, entry(t, node, "blob"), "!!binary", "aGVsbG8=")
++	expectScalar(t, entry(t, node, "when"), "!!timestamp", "2024-01-02T03:04:05Z")
++	expectScalar(t, entry(t, node, "unicode"), "!!str", "héllo 世界")
++}
++
++func TestPropertyListDecodesBinaryContainers(t *testing.T) {
++	node := mustDecode(t, "plist", fixture(t, binaryNested))
++
++	list := entry(t, node, "list")
++	expectKind(t, list, yqlib.SequenceNode, 5)
++	expectScalar(t, list.Content[0], "!!str", "a")
++	expectScalar(t, list.Content[1], "!!int", "1")
++	expectScalar(t, list.Content[2], "!!bool", "true")
++	expectKind(t, list.Content[3], yqlib.SequenceNode, 2)
++	expectScalar(t, list.Content[3].Content[0], "!!int", "2")
++	expectKind(t, list.Content[4], yqlib.MappingNode, 2)
++	expectScalar(t, entry(t, list.Content[4], "k"), "!!str", "v")
++
++	expectKind(t, entry(t, node, "emptyDict"), yqlib.MappingNode, 0)
++	expectKind(t, entry(t, node, "emptyList"), yqlib.SequenceNode, 0)
++}
++
++func TestPropertyListDecodesBinaryLargeCollections(t *testing.T) {
++	node := mustDecode(t, "plist", fixture(t, binaryLongCount))
++	expectKind(t, node, yqlib.MappingNode, 40)
++	expectScalar(t, entry(t, node, "k00"), "!!int", "0")
++	expectScalar(t, entry(t, node, "k19"), "!!int", "19")
++}
++
++func TestPropertyListRejectsBadBinary(t *testing.T) {
++	full := fixture(t, binaryKitchenSink)
++
++	truncatedBody := append([]byte{}, full[:40]...)
++
++	badRoot := append([]byte{}, full...)
++	binary.BigEndian.PutUint64(badRoot[len(badRoot)-16:len(badRoot)-8], 9999)
++
++	badTable := append([]byte{}, full...)
++	binary.BigEndian.PutUint64(badTable[len(badTable)-8:], 999999)
++
++	cases := map[string][]byte{
++		"header only":           []byte("bplist00"),
++		"truncated":             truncatedBody,
++		"root out of range":     badRoot,
++		"offset table past end": badTable,
++	}
++
++	for name, document := range cases {
++		t.Run(name, func(t *testing.T) {
++			if _, err := decodeWith(t, "plist", document); err == nil {
++				t.Error("expected an error, got none")
++			}
++		})
++	}
++}
++
++func TestPropertyListEncodesBinary(t *testing.T) {
++	node := parseYAML(t, `name: com.example.agent
++enabled: true
++disabled: false
++tiny: 7
++small: 300
++medium: 70000
++large: 1099511627776
++negative: -42
++ratio: 0.5
++unicode: "héllo 世界"
++list: [a, 1, [deep]]
++emptyDict: {}
++emptyList: []
++`)
++	encoded := mustEncode(t, "bplist", node)
++	expectBinaryPlistShape(t, encoded)
++
++	back := mustDecode(t, "bplist", encoded)
++	expectScalar(t, entry(t, back, "name"), "!!str", "com.example.agent")
++	expectScalar(t, entry(t, back, "enabled"), "!!bool", "true")
++	expectScalar(t, entry(t, back, "disabled"), "!!bool", "false")
++	expectScalar(t, entry(t, back, "tiny"), "!!int", "7")
++	expectScalar(t, entry(t, back, "small"), "!!int", "300")
++	expectScalar(t, entry(t, back, "medium"), "!!int", "70000")
++	expectScalar(t, entry(t, back, "large"), "!!int", "1099511627776")
++	expectScalar(t, entry(t, back, "negative"), "!!int", "-42")
++	expectFloat(t, entry(t, back, "ratio"), 0.5)
++	expectScalar(t, entry(t, back, "unicode"), "!!str", "héllo 世界")
++
++	list := entry(t, back, "list")
++	expectKind(t, list, yqlib.SequenceNode, 3)
++	expectKind(t, list.Content[2], yqlib.SequenceNode, 1)
++	expectScalar(t, list.Content[2].Content[0], "!!str", "deep")
++
++	expectKind(t, entry(t, back, "emptyDict"), yqlib.MappingNode, 0)
++	expectKind(t, entry(t, back, "emptyList"), yqlib.SequenceNode, 0)
++}
++
++func TestPropertyListEncodesBinaryLargeCollections(t *testing.T) {
++	var builder strings.Builder
++	for index := 0; index < 40; index++ {
++		builder.WriteString("key")
++		builder.WriteString(string(rune('a' + index%26)))
++		builder.WriteString(string(rune('a' + index/26)))
++		builder.WriteString(": ")
++		builder.WriteString(strings.Repeat("v", index+1))
++		builder.WriteString("\n")
++	}
++
++	node := parseYAML(t, builder.String())
++	encoded := mustEncode(t, "bplist", node)
++	expectBinaryPlistShape(t, encoded)
++
++	back := mustDecode(t, "bplist", encoded)
++	expectKind(t, back, yqlib.MappingNode, 80)
++	expectScalar(t, entry(t, back, "keyaa"), "!!str", "v")
++}
++
++func TestPropertyListEncodesBinaryDatesAndData(t *testing.T) {
++	node := mustDecode(t, "plist", []byte(kitchenSinkXML))
++
++	encoded := mustEncode(t, "bplist", node)
++	expectBinaryPlistShape(t, encoded)
++
++	back := mustDecode(t, "bplist", encoded)
++	expectScalar(t, entry(t, back, "when"), "!!timestamp", "2024-01-02T03:04:05Z")
++	expectScalar(t, entry(t, back, "blob"), "!!binary", "aGVsbG8=")
++}
++
++func TestPropertyListConvertsBetweenFlavours(t *testing.T) {
++	fromBinary := mustDecode(t, "plist", fixture(t, binaryKitchenSink))
++	asXML := mustEncode(t, "plist", fromBinary)
++
++	if !bytes.HasPrefix(asXML, []byte(xmlHeader)) {
++		t.Fatalf("xml output is missing the property list header:\n%v", string(asXML))
++	}
++
++	reread := mustDecode(t, "plist", asXML)
++	expectScalar(t, entry(t, reread, "large"), "!!int", "1099511627776")
++	expectScalar(t, entry(t, reread, "unicode"), "!!str", "héllo 世界")
++	expectScalar(t, entry(t, reread, "when"), "!!timestamp", "2024-01-02T03:04:05Z")
++
++	backToBinary := mustEncode(t, "bplist", reread)
++	expectBinaryPlistShape(t, backToBinary)
++
++	final := mustDecode(t, "plist", backToBinary)
++	expectScalar(t, entry(t, final, "blob"), "!!binary", "aGVsbG8=")
++	expectFloat(t, entry(t, final, "ratio"), 0.5)
++}
