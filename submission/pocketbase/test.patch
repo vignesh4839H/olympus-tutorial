@@ -1,9 +1,9 @@
 diff --git a/apis/record_soft_delete_280aff_test.go b/apis/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..ba933e6
+index 0000000..d427cf3
 --- /dev/null
 +++ b/apis/record_soft_delete_280aff_test.go
-@@ -0,0 +1,431 @@
+@@ -0,0 +1,459 @@
 +package apis_test
 +
 +import (
@@ -293,6 +293,34 @@ index 0000000..ba933e6
 +			},
 +		},
 +		{
++			Name:   "restoring is guarded by the collection update rule",
++			Method: http.MethodPost,
++			URL:    "/api/collections/sd_api_posts/records/" + sdTrashedRecordId + "/restore",
++			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
++				sdApiSetup(t, app)
++
++				collection, err := app.FindCollectionByNameOrId("sd_api_posts")
++				if err != nil {
++					t.Fatal(err)
++				}
++
++				// a nil rule locks the action down to superusers
++				collection.UpdateRule = nil
++				if err := app.Save(collection); err != nil {
++					t.Fatal(err)
++				}
++			},
++			ExpectedStatus: 403,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindTrashedRecordById("sd_api_posts", sdTrashedRecordId); err != nil {
++					t.Fatalf("expected the record to stay in the trash, got %v", err)
++				}
++			},
++		},
++		{
 +			Name:           "restoring is unsupported for regular collections",
 +			Method:         http.MethodPost,
 +			URL:            "/api/collections/sd_api_plain/records/" + sdPlainRecordId + "/restore",
@@ -437,10 +465,10 @@ index 0000000..ba933e6
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..5d92b2e
+index 0000000..faee0d9
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1054 @@
+@@ -0,0 +1,1148 @@
 +package core_test
 +
 +import (
@@ -1493,6 +1521,100 @@ index 0000000..5d92b2e
 +
 +	if _, err := app.FindRecordById(comments, comment.Id); !errors.Is(err, sql.ErrNoRows) {
 +		t.Fatalf("expected the comment to follow the last live post into the trash, got %v", err)
++	}
++}
++
++func TestSoftDeleteTogglingKeepsExistingRecords(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	live := sdNewRecord(t, app, posts, map[string]any{"title": "stays live"})
++	trashed := sdNewRecord(t, app, posts, map[string]any{"title": "was trashed"})
++
++	if err := app.Delete(trashed); err != nil {
++		t.Fatal(err)
++	}
++
++	t.Run("turning the mode off keeps every row", func(t *testing.T) {
++		posts.SoftDelete = false
++		if err := app.Save(posts); err != nil {
++			t.Fatal(err)
++		}
++
++		records, err := app.FindAllRecords(posts)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if len(records) != 2 {
++			t.Fatalf("expected both records to be visible, got %v", sdFindIds(t, records))
++		}
++	})
++
++	t.Run("turning the mode back on keeps them visible", func(t *testing.T) {
++		posts.SoftDelete = true
++		if err := app.Save(posts); err != nil {
++			t.Fatal(err)
++		}
++
++		records, err := app.FindAllRecords(posts)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		if len(records) != 2 {
++			t.Fatalf("expected both records to stay visible, got %v", sdFindIds(t, records))
++		}
++
++		for _, id := range []string{live.Id, trashed.Id} {
++			if _, err := app.FindRecordById(posts, id); err != nil {
++				t.Fatalf("expected %q to be readable, got %v", id, err)
++			}
++		}
++	})
++}
++
++func TestSoftDeletePurgeTrashedRecordsWithZeroTime(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	first := sdNewRecord(t, app, posts, map[string]any{"title": "one"})
++	second := sdNewRecord(t, app, posts, map[string]any{"title": "two"})
++	kept := sdNewRecord(t, app, posts, map[string]any{"title": "three"})
++
++	if err := app.Delete(first); err != nil {
++		t.Fatal(err)
++	}
++	if err := app.Delete(second); err != nil {
++		t.Fatal(err)
++	}
++
++	// the zero time means the whole trash, however recently it was filled
++	purged, err := app.PurgeTrashedRecords(posts, types.DateTime{})
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if purged != 2 {
++		t.Fatalf("expected 2 purged records, got %d", purged)
++	}
++
++	for _, id := range []string{first.Id, second.Id} {
++		if sdRawExists(t, app, posts, id) {
++			t.Fatalf("expected the %q row to be removed", id)
++		}
++	}
++
++	if !sdRawExists(t, app, posts, kept.Id) {
++		t.Fatal("expected the live record row to be kept")
 +	}
 +}
 diff --git a/plugins/jsvm/binds_test.go b/plugins/jsvm/binds_test.go
