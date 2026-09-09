@@ -70,7 +70,7 @@ index d6d8b58..fe33346 100644
  	collection := record.Collection()
  	if collection == nil {
 diff --git a/apis/record_crud.go b/apis/record_crud.go
-index 3a35e93..e118784 100644
+index 3a35e93..090c8a0 100644
 --- a/apis/record_crud.go
 +++ b/apis/record_crud.go
 @@ -6,6 +6,7 @@ import (
@@ -349,7 +349,7 @@ index 3a35e93..e118784 100644
 +		event.Collection = collection
 +		event.Record = record
 +
-+		hookErr := e.App.OnRecordRestoreRequest().Trigger(event, func(e *core.RecordRequestEvent) error {
++		hookErr := e.App.OnRecordUpdateRequest().Trigger(event, func(e *core.RecordRequestEvent) error {
 +			if err := e.App.RestoreRecord(e.Record); err != nil {
 +				return firstApiError(err, e.BadRequestError("Failed to restore record.", err))
 +			}
@@ -395,7 +395,7 @@ index 3a35e93..e118784 100644
  
  func recordDataFromRequest(e *core.RequestEvent, record *core.Record) (map[string]any, error) {
 diff --git a/core/app.go b/core/app.go
-index 1bbec9c..406fba4 100644
+index 1bbec9c..8a47094 100644
 --- a/core/app.go
 +++ b/core/app.go
 @@ -15,6 +15,7 @@ import (
@@ -481,65 +481,11 @@ index 1bbec9c..406fba4 100644
  	// FindRecordsByIds finds all records by the specified ids.
  	// If no records are found, returns an empty slice.
  	FindRecordsByIds(collectionModelOrIdentifier any, recordIds []string, optFilters ...func(q *dbx.SelectQuery) error) ([]*Record, error)
-@@ -1519,6 +1583,16 @@ type App interface {
- 	// triggered and called only if their event data origin matches the tags.
- 	OnRecordDeleteRequest(tags ...string) *hook.TaggedHook[*RecordRequestEvent]
- 
-+	// OnRecordRestoreRequest hook is triggered on each API Record restore request.
-+	//
-+	// Could be used to additionally validate the request data or implement
-+	// completely different persistence behavior.
-+	//
-+	// If the optional "tags" list (Collection ids or names) is specified,
-+	// then all event handlers registered via the created hook will be
-+	// triggered and called only if their event data origin matches the tags.
-+	OnRecordRestoreRequest(tags ...string) *hook.TaggedHook[*RecordRequestEvent]
-+
- 	// ---------------------------------------------------------------
- 	// Collection API event hooks
- 	// ---------------------------------------------------------------
 diff --git a/core/base.go b/core/base.go
-index 3d0f41c..8a41d3e 100644
+index 3d0f41c..a7fef01 100644
 --- a/core/base.go
 +++ b/core/base.go
-@@ -189,11 +189,12 @@ type BaseApp struct {
- 	onRecordAuthWithOTPRequest          *hook.Hook[*RecordAuthWithOTPRequestEvent]
- 
- 	// record crud API event hooks
--	onRecordsListRequest  *hook.Hook[*RecordsListRequestEvent]
--	onRecordViewRequest   *hook.Hook[*RecordRequestEvent]
--	onRecordCreateRequest *hook.Hook[*RecordRequestEvent]
--	onRecordUpdateRequest *hook.Hook[*RecordRequestEvent]
--	onRecordDeleteRequest *hook.Hook[*RecordRequestEvent]
-+	onRecordsListRequest   *hook.Hook[*RecordsListRequestEvent]
-+	onRecordViewRequest    *hook.Hook[*RecordRequestEvent]
-+	onRecordCreateRequest  *hook.Hook[*RecordRequestEvent]
-+	onRecordUpdateRequest  *hook.Hook[*RecordRequestEvent]
-+	onRecordDeleteRequest  *hook.Hook[*RecordRequestEvent]
-+	onRecordRestoreRequest *hook.Hook[*RecordRequestEvent]
- 
- 	// collection API event hooks
- 	onCollectionsListRequest   *hook.Hook[*CollectionsListRequestEvent]
-@@ -346,6 +347,7 @@ func (app *BaseApp) initHooks() {
- 	app.onRecordCreateRequest = &hook.Hook[*RecordRequestEvent]{}
- 	app.onRecordUpdateRequest = &hook.Hook[*RecordRequestEvent]{}
- 	app.onRecordDeleteRequest = &hook.Hook[*RecordRequestEvent]{}
-+	app.onRecordRestoreRequest = &hook.Hook[*RecordRequestEvent]{}
- 
- 	// collection API event hooks
- 	app.onCollectionsListRequest = &hook.Hook[*CollectionsListRequestEvent]{}
-@@ -1198,6 +1200,10 @@ func (app *BaseApp) OnRecordDeleteRequest(tags ...string) *hook.TaggedHook[*Reco
- 	return hook.NewTaggedHook(app.onRecordDeleteRequest, tags...)
- }
- 
-+func (app *BaseApp) OnRecordRestoreRequest(tags ...string) *hook.TaggedHook[*RecordRequestEvent] {
-+	return hook.NewTaggedHook(app.onRecordRestoreRequest, tags...)
-+}
-+
- // -------------------------------------------------------------------
- // Collection API event hooks
- // -------------------------------------------------------------------
-@@ -1348,6 +1354,14 @@ func supportFiles(m Model) bool {
+@@ -1348,6 +1348,14 @@ func supportFiles(m Model) bool {
  	return false
  }
  
@@ -554,7 +500,7 @@ index 3d0f41c..8a41d3e 100644
  func (app *BaseApp) registerBaseHooks() {
  	deletePrefix := func(prefix string) error {
  		fs, err := app.NewFilesystem()
-@@ -1375,7 +1389,9 @@ func (app *BaseApp) registerBaseHooks() {
+@@ -1375,7 +1383,9 @@ func (app *BaseApp) registerBaseHooks() {
  	app.OnModelAfterDeleteSuccess().Bind(&hook.Handler[*ModelEvent]{
  		Id: "__pbFilesManagerDelete__",
  		Func: func(e *ModelEvent) error {
@@ -565,7 +511,7 @@ index 3d0f41c..8a41d3e 100644
  				// ensure that there is a trailing slash so that the list iterator could start walking from the prefix dir
  				// (https://github.com/pocketbase/pocketbase/discussions/5246#discussioncomment-10128955)
  				prefix := strings.TrimRight(m.BaseFilesPath(), "/") + "/"
-@@ -1593,6 +1609,13 @@ func (app *BaseApp) initLogger() error {
+@@ -1593,6 +1603,13 @@ func (app *BaseApp) initLogger() error {
  		Priority: -999,
  	})
  

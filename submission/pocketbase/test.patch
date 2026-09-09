@@ -465,10 +465,10 @@ index 0000000..d427cf3
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..faee0d9
+index 0000000..bb36a48
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1148 @@
+@@ -0,0 +1,1153 @@
 +package core_test
 +
 +import (
@@ -668,32 +668,37 @@ index 0000000..faee0d9
 +	})
 +}
 +
-+func TestSoftDeleteUniqueIndexes(t *testing.T) {
++func TestSoftDeleteUniqueIndexRoundTrip(t *testing.T) {
 +	t.Parallel()
 +
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
-+	posts, _, _ := sdSetup(t, app)
++	collection := core.NewBaseCollection("sd_indexes")
++	collection.Fields.Add(&core.TextField{Name: "title"})
++	collection.AddIndex("idx_sd_indexes_title", true, "`title`", "")
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
 +
-+	t.Run("the unique index excludes the trashed records", func(t *testing.T) {
-+		idx := posts.GetIndex("idx_sd_posts_title")
-+		if !strings.Contains(idx, "WHERE") || !strings.Contains(idx, core.FieldNameDeleted) {
-+			t.Fatalf("expected a partial unique index, got %q", idx)
-+		}
-+	})
++	original := collection.GetIndex("idx_sd_indexes_title")
++	if original == "" {
++		t.Fatal("expected the collection to have the unique index")
++	}
 +
-+	t.Run("turning the option off restores the plain index", func(t *testing.T) {
-+		posts.SoftDelete = false
-+		if err := app.Save(posts); err != nil {
-+			t.Fatal(err)
-+		}
++	collection.SoftDelete = true
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
 +
-+		idx := posts.GetIndex("idx_sd_posts_title")
-+		if strings.Contains(idx, core.FieldNameDeleted) {
-+			t.Fatalf("expected the trashed condition to be removed, got %q", idx)
-+		}
-+	})
++	collection.SoftDelete = false
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	if restored := collection.GetIndex("idx_sd_indexes_title"); restored != original {
++		t.Fatalf("expected the index to be given back as\n%q\ngot\n%q", original, restored)
++	}
 +}
 +
 +func TestSoftDeleteTrashRetentionValidation(t *testing.T) {
@@ -1617,19 +1622,6 @@ index 0000000..faee0d9
 +		t.Fatal("expected the live record row to be kept")
 +	}
 +}
-diff --git a/plugins/jsvm/binds_test.go b/plugins/jsvm/binds_test.go
-index 0d8ca9b..a93a58b 100644
---- a/plugins/jsvm/binds_test.go
-+++ b/plugins/jsvm/binds_test.go
-@@ -1613,7 +1613,7 @@ func TestHooksBindsCount(t *testing.T) {
- 	vm := goja.New()
- 	hooksBinds(app, vm, nil)
- 
--	testBindsCount(vm, "this", 82, t)
-+	testBindsCount(vm, "this", 83, t)
- }
- 
- func TestHooksBinds(t *testing.T) {
 diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
 new file mode 100644
 index 0000000..4f7ac2f

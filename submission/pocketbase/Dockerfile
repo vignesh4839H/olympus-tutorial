@@ -9,6 +9,8 @@ ENV GOFLAGS="-mod=readonly"
 
 RUN go version
 
+RUN test -f go.mod && test -f go.sum
+
 RUN go mod download
 
 RUN go mod verify
