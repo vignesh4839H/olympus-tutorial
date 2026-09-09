@@ -1,9 +1,9 @@
 diff --git a/apis/record_soft_delete_280aff_test.go b/apis/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..d427cf3
+index 0000000..c43525c
 --- /dev/null
 +++ b/apis/record_soft_delete_280aff_test.go
-@@ -0,0 +1,459 @@
+@@ -0,0 +1,469 @@
 +package apis_test
 +
 +import (
@@ -176,6 +176,16 @@ index 0000000..d427cf3
 +			ExpectedStatus: 200,
 +			ExpectedContent: []string{
 +				`"id":"` + sdTrashedRecordId + `"`,
++			},
++		},
++		{
++			Name:           "the parameter is ignored for regular collections",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_plain/records/" + sdPlainRecordId + "?trashed=only",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdPlainRecordId + `"`,
 +			},
 +		},
 +		{
@@ -465,15 +475,14 @@ index 0000000..d427cf3
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..bb36a48
+index 0000000..b0d9ef0
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1153 @@
+@@ -0,0 +1,1152 @@
 +package core_test
 +
 +import (
 +	"database/sql"
-+	"encoding/json/v2"
 +	"errors"
 +	"strings"
 +	"testing"
@@ -646,7 +655,7 @@ index 0000000..bb36a48
 +	posts, _, plain := sdSetup(t, app)
 +
 +	t.Run("regular collections are serialized as before", func(t *testing.T) {
-+		raw, err := json.Marshal(plain)
++		raw, err := plain.MarshalJSON()
 +		if err != nil {
 +			t.Fatal(err)
 +		}
@@ -657,7 +666,7 @@ index 0000000..bb36a48
 +	})
 +
 +	t.Run("soft delete collections expose the option", func(t *testing.T) {
-+		raw, err := json.Marshal(posts)
++		raw, err := posts.MarshalJSON()
 +		if err != nil {
 +			t.Fatal(err)
 +		}
