@@ -294,3 +294,25 @@ sentence; the length check passes with room to spare at 215 words.
 
 `solution.patch` is still untouched. Meaningful LOC remains 764, and the contract holds:
 35 new tests fail on the clean commit, all 35 pass with the solution.
+
+---
+
+## Outcome: REJECTED at the Scope Gate
+
+This submission passed every precheck (12/12 description & tests, plagiarism clean,
+Dockerfile 2/2, solution patch 1/1) but was rejected by the Scope Gate as
+**publicly-solved**:
+
+> Drop: a public Go plist package directly linked from a yq issue already implements
+> automatic XML/binary plist decoding and both writers. It covers 14 of 21 graded test
+> functions and the entire hardest binary codec (745 of 1,279 reference-authored lines).
+
+The blocker was `DHowett/go-plist`. Every duplicate comparison against other Olympus
+submissions came back distinct (0 of 1,279 lines corresponding), so novelty against
+peers was never the problem.
+
+**Lesson carried forward:** any task shaped "implement well-known format or protocol X"
+is disqualified by construction, because published specs have libraries. The hard part
+has to live in the repository's own types, where nothing can be dropped in.
+
+Kept for reference only. Superseded by `../pocketbase/`.
