@@ -302,11 +302,11 @@ index 00000000..f6124972
 +STATUS=${PIPESTATUS[0]}
 +
 +exit "$STATUS"
-diff --git a/test/formats/property_list_test.go b/test/formats/property_list_test.go
+diff --git a/test/formats/property_list_ce3de1_test.go b/test/formats/property_list_ce3de1_test.go
 new file mode 100644
 index 00000000..4fc206f8
 --- /dev/null
-+++ b/test/formats/property_list_test.go
++++ b/test/formats/property_list_ce3de1_test.go
 @@ -0,0 +1,610 @@
 +package formats
 +

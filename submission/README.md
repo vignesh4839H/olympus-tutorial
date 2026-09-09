@@ -27,7 +27,7 @@ Everything in this folder is ready to paste into the submission form.
 
 ## 3. Task prompt
 
-See [`task_prompt.md`](./task_prompt.md). 259 words, plain prose, no URLs, pure ASCII.
+See [`task_prompt.md`](./task_prompt.md). 215 words, plain prose, no URLs, pure ASCII.
 
 ## 4. Dockerfile
 
@@ -42,7 +42,7 @@ See [`test.patch`](./test.patch). It adds three files and touches no production 
 | File | Purpose |
 | --- | --- |
 | `test.sh` | the `base` / `new` harness |
-| `test/formats/property_list_test.go` | 35 hidden tests |
+| `test/formats/property_list_ce3de1_test.go` | 35 hidden tests |
 | `scripts/junitreport/main.go` | converts `go test -json` into JUnit XML |
 
 The tests live in their own package (`test/formats`) so that `base` can run every existing suite
@@ -228,3 +228,69 @@ length check passes comfortably at either size.
 
 `solution.patch` and `test.patch` were not touched this round. Meaningful LOC is still 764,
 and the contract still holds: 35 new tests fail on the clean commit, all pass with the solution.
+
+## 11. Third precheck round
+
+One failure and three warnings. All cleared.
+
+### Failure — test filenames collide with predictable defaults
+
+The check predicted an implementer would create `pkg/yqlib/property_list_test.go` and
+matched it against `test/formats/property_list_test.go` on basename. It asks for a random
+hash in the name. Renamed to:
+
+```
+test/formats/property_list_ce3de1_test.go
+```
+
+Hash from `openssl rand -hex 3`. `test.sh` targets the package (`./test/formats/...`), not
+the file, so nothing else needed changing. This was the only blocking item.
+
+### Warning — Dockerfile toolchain not "installed or activated"
+
+The checker does not accept that `ENV GOTOOLCHAIN=go1.25.0` on its own makes the go
+command fetch that toolchain. It does — but the claim is not visible from the file, so
+added an explicit step that performs and proves the activation:
+
+```
+RUN go version
+```
+
+With the pin in place this downloads go1.25.0 when the base image ships something older
+and prints the version actually in use, so a toolchain problem fails at that line rather
+than deep in the build. Confirmed against a cold cache: `go: downloading go1.25.0`, then
+`go version go1.25.0 linux/amd64`.
+
+The second half of that warning — that pinning only holds if `go.mod` and `go.sum` are
+committed — is conditional and already satisfied: yq commits both at the pinned commit.
+
+### Warning — .plist should resolve to the plist format name
+
+Fair and specific. The prompt said a `.plist` file "should be recognised as a property
+list" while the test asserts the format name resolves to `plist`. Now says "should be
+recognised as the plist format".
+
+### Warning — only necessary information, now with a HIGH item
+
+Took all four, cutting the prompt from 259 to 215 words: dropped the enumerated failure
+modes, "so a second read reports end of input", "holding its base64 text", and "laid out
+the way Apple's own tools write one".
+
+Worth recording that this check is not self-consistent between runs. Last round it told
+me to keep the binary misalignment case as "less obvious"; this round it flagged that same
+clause HIGH and asked for its removal. Its own note says only high severity blocks, so the
+medium and low items in both rounds were optional.
+
+### Where the fairness budget now stands
+
+Nine behaviours the hidden tests assert now rest on being discoverable rather than stated:
+the container and scalar tag mappings, the twelve specific error cases, registration of
+both names, XML escaping, and EOF on a second read. Each is defensible on its own — they
+are all either the only sensible choice, yq's existing convention, or a direct consequence
+of producing a well formed document. But the trimming checker and the alignment checker
+pull in opposite directions, and alignment is the one that matters at human review. If a
+rollout fails an agent on one of these rather than on the binary flavour, restore that
+sentence; the length check passes with room to spare at 215 words.
+
+`solution.patch` is still untouched. Meaningful LOC remains 764, and the contract holds:
+35 new tests fail on the clean commit, all 35 pass with the solution.
