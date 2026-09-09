@@ -17,9 +17,9 @@
 
 ## Measured results
 
-- **622 meaningful production LOC** added by the solution patch (blank lines,
+- **628 meaningful production LOC** added by the solution patch (blank lines,
   comments, imports, braces and test files excluded).
-- **72 graded test cases** across `core` and `apis`.
+- **79 graded test cases** across `core` and `apis`.
 - Verified in a clean checkout of the pinned commit:
   - test patch only -> `./test.sh base` **passes**, `./test.sh new` **fails**
   - test + solution -> `./test.sh base` **passes**, `./test.sh new` **passes**
@@ -55,7 +55,7 @@ The difficulty lives in the interactions:
 `core/collection_model_base_options.go`, `core/record_field_resolver.go`,
 `core/record_query_expand.go`, `core/app.go`, `core/base.go`, `core/field.go`,
 `apis/record_crud.go`, `apis/realtime.go`, `apis/batch.go`,
-`forms/record_upsert.go`, `plugins/jsvm/binds_test.go`.
+`forms/record_upsert.go`, (test files live in the test patch).
 
 ## Sibling directory
 

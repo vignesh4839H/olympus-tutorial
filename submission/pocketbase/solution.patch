@@ -1324,10 +1324,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..43c5f03
+index 0000000..7bda3cc
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,546 @@
+@@ -0,0 +1,566 @@
 +package core
 +
 +import (
@@ -1608,9 +1608,10 @@ index 0000000..43c5f03
 +						return err
 +					}
 +
-+					// for a multi-value relation the referencing record follows
-+					// the main one only if there is nothing else keeping it alive
-+					if len(refRecord.GetStringSlice(relField.Name)) > 1 {
++					// for a multi-value relation the referencing record follows the
++					// main one only if the trashed record is the last live record
++					// it still points at
++					if hasOtherLiveReference(app, mainRecord, refRecord, relField) {
 +						return nil
 +					}
 +
@@ -1624,6 +1625,25 @@ index 0000000..43c5f03
 +	}
 +
 +	return nil
++}
++
++// hasOtherLiveReference checks whether the referencing record still points at
++// a visible record other than the one that is being trashed.
++//
++// The relation values are left alone by the trash, so the ids alone cannot
++// tell whether anything is still keeping the referencing record alive.
++func hasOtherLiveReference(app App, mainRecord *Record, refRecord *Record, relField *RelationField) bool {
++	for _, id := range refRecord.GetStringSlice(relField.Name) {
++		if id == mainRecord.Id {
++			continue
++		}
++
++		if _, err := app.FindRecordById(mainRecord.Collection(), id); err == nil {
++			return true
++		}
++	}
++
++	return false
 +}
 +
 +// restoreCascadedRecords brings back the records that were moved to the trash
@@ -1889,16 +1909,3 @@ index 16df0ec..d70e7e8 100644
  
  	isAuth := form.record.Collection().IsAuth()
  
-diff --git a/plugins/jsvm/binds_test.go b/plugins/jsvm/binds_test.go
-index 0d8ca9b..a93a58b 100644
---- a/plugins/jsvm/binds_test.go
-+++ b/plugins/jsvm/binds_test.go
-@@ -1613,7 +1613,7 @@ func TestHooksBindsCount(t *testing.T) {
- 	vm := goja.New()
- 	hooksBinds(app, vm, nil)
- 
--	testBindsCount(vm, "this", 82, t)
-+	testBindsCount(vm, "this", 83, t)
- }
- 
- func TestHooksBinds(t *testing.T) {

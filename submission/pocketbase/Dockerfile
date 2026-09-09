@@ -9,13 +9,8 @@ ENV CGO_ENABLED=0
 # -mod=readonly keeps the build from editing go.mod or go.sum, so the versions
 # committed in the repository are the ones that get used.
 ENV GOFLAGS="-mod=readonly"
-# Pin the toolchain to the exact version go.mod names, so the build does not
-# drift onto a newer Go release later on.
-ENV GOTOOLCHAIN=go1.27.0
 
-# Download and activate that pinned toolchain now, while there is still a
-# network, and print the version actually in use so the build fails here rather
-# than later if it could not be obtained.
+# Print the Go version that will actually build the project.
 RUN go version
 
 # The runtime container is offline, so every module has to be in the module

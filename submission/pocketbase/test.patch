@@ -1,9 +1,9 @@
 diff --git a/apis/record_soft_delete_280aff_test.go b/apis/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..5bd4c5b
+index 0000000..ba933e6
 --- /dev/null
 +++ b/apis/record_soft_delete_280aff_test.go
-@@ -0,0 +1,390 @@
+@@ -0,0 +1,431 @@
 +package apis_test
 +
 +import (
@@ -236,6 +236,16 @@ index 0000000..5bd4c5b
 +			},
 +		},
 +		{
++			Name:           "a non-boolean purge value is rejected",
++			Method:         http.MethodDelete,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId + "?purge=maybe",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 400,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++		{
 +			Name:           "a trashed record cannot be deleted without purge",
 +			Method:         http.MethodDelete,
 +			URL:            "/api/collections/sd_api_posts/records/" + sdTrashedRecordId,
@@ -336,6 +346,37 @@ index 0000000..5bd4c5b
 +			},
 +		},
 +		{
++			Name:   "before keeps the more recently trashed records",
++			Method: http.MethodDelete,
++			URL:    "/api/collections/sd_api_posts/trash?before=2020-01-01%2000%3A00%3A00.000Z",
++			Headers: map[string]string{
++				"Authorization": sdSuperuserToken,
++			},
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"purged":0`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindTrashedRecordById("sd_api_posts", sdTrashedRecordId); err != nil {
++					t.Fatalf("expected the recently trashed record to be kept, got %v", err)
++				}
++			},
++		},
++		{
++			Name:   "an invalid before value is rejected",
++			Method: http.MethodDelete,
++			URL:    "/api/collections/sd_api_posts/trash?before=not-a-date",
++			Headers: map[string]string{
++				"Authorization": sdSuperuserToken,
++			},
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 400,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++		{
 +			Name:   "emptying the trash of a regular collection is rejected",
 +			Method: http.MethodDelete,
 +			URL:    "/api/collections/sd_api_plain/trash",
@@ -396,10 +437,10 @@ index 0000000..5bd4c5b
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..e3326cd
+index 0000000..5d92b2e
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,945 @@
+@@ -0,0 +1,1054 @@
 +package core_test
 +
 +import (
@@ -1345,6 +1386,128 @@ index 0000000..e3326cd
 +		t.Fatalf("expected the comment to be restored with its post, got %v", err)
 +	}
 +}
++
++func TestSoftDeleteConflictingDeletedField(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	collection := core.NewBaseCollection("sd_conflict")
++	collection.Fields.Add(&core.TextField{Name: core.FieldNameDeleted})
++	collection.SoftDelete = true
++
++	if err := app.Save(collection); err == nil {
++		t.Fatal("expected an error when the collection already has a non-date deleted field")
++	}
++}
++
++func TestSoftDeleteTrashedLookupsRequireTheMode(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	_, _, plain := sdSetup(t, app)
++
++	record := sdNewRecord(t, app, plain, map[string]any{"title": "plain"})
++
++	if _, err := app.FindTrashedRecordById(plain, record.Id); err == nil {
++		t.Fatal("expected FindTrashedRecordById to reject a collection without the mode")
++	}
++
++	if _, err := app.FindAllTrashedRecords(plain); err == nil {
++		t.Fatal("expected FindAllTrashedRecords to reject a collection without the mode")
++	}
++}
++
++func TestSoftDeleteZeroRetentionKeepsTheTrash(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	record := sdNewRecord(t, app, posts, map[string]any{"title": "kept"})
++
++	if err := app.Delete(record); err != nil {
++		t.Fatal(err)
++	}
++
++	// backdate it well beyond any plausible retention
++	_, err := app.DB().Update(
++		posts.Name,
++		dbx.Params{core.FieldNameDeleted: types.NowDateTime().Add(-9000 * time.Hour).String()},
++		dbx.HashExp{"id": record.Id},
++	).Execute()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.PurgeExpiredTrashedRecords(); err != nil {
++		t.Fatal(err)
++	}
++
++	if !sdRawExists(t, app, posts, record.Id) {
++		t.Fatal("expected a collection without a retention to keep its trash")
++	}
++}
++
++func TestSoftDeleteMultiValueCascadeNeedsTheLastReference(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	comments.Fields.Add(&core.RelationField{
++		Name:          "posts",
++		CollectionId:  posts.Id,
++		CascadeDelete: true,
++		MaxSelect:     5,
++	})
++	if err := app.Save(comments); err != nil {
++		t.Fatal(err)
++	}
++
++	first := sdNewRecord(t, app, posts, map[string]any{"title": "first"})
++	second := sdNewRecord(t, app, posts, map[string]any{"title": "second"})
++	comment := sdNewRecord(t, app, comments, map[string]any{
++		"message": "shared",
++		"posts":   []string{first.Id, second.Id},
++	})
++
++	if err := app.Delete(first); err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := app.FindRecordById(comments, comment.Id); err != nil {
++		t.Fatalf("expected the comment to stay visible while another post is live, got %v", err)
++	}
++
++	if err := app.Delete(second); err != nil {
++		t.Fatal(err)
++	}
++
++	if _, err := app.FindRecordById(comments, comment.Id); !errors.Is(err, sql.ErrNoRows) {
++		t.Fatalf("expected the comment to follow the last live post into the trash, got %v", err)
++	}
++}
+diff --git a/plugins/jsvm/binds_test.go b/plugins/jsvm/binds_test.go
+index 0d8ca9b..a93a58b 100644
+--- a/plugins/jsvm/binds_test.go
++++ b/plugins/jsvm/binds_test.go
+@@ -1613,7 +1613,7 @@ func TestHooksBindsCount(t *testing.T) {
+ 	vm := goja.New()
+ 	hooksBinds(app, vm, nil)
+ 
+-	testBindsCount(vm, "this", 82, t)
++	testBindsCount(vm, "this", 83, t)
+ }
+ 
+ func TestHooksBinds(t *testing.T) {
 diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
 new file mode 100644
 index 0000000..4f7ac2f
