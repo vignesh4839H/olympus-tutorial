@@ -2,9 +2,9 @@ Add an opt-in soft delete mode to "base" collections. Deleting a record should m
 
 Turn it on per collection with a `softDelete` boolean in the collection options, beside `trashRetention`, seconds until a trashed record expires; zero keeps it forever. Setting a retention while the mode is off is a validation error. With the mode on the collection grows a system date field called `deleted` holding when the record was trashed, and loses it when the mode goes off. The option itself shows up in the serialized options only while it is on. Flipping the switch either way must not disturb the records already there. If the collection already has a non-date `deleted` field, refuse to enable.
 
-Delete a record that is already trashed and it goes for good. `App.PurgeRecord` skips the trash entirely and does the same to a live one. Both keep the existing cascade for referencing records, trashed ones included, and everything they reach goes permanently.
+Delete a record that is already trashed and it goes for good. `App.PurgeRecord` skips the trash entirely and does the same to a live one. Both pull in the referencing records, trashed ones included, and everything they reach goes permanently.
 
-Nothing ordinary should see a trashed record. That includes relation, back-relation and `@collection` filters, and expanding a relation onto one gives back nothing. To reach them: `App.FindRecordByIdWithTrashed`, `App.FindTrashedRecordById`, `App.FindAllTrashedRecords`. The last two error without the mode. Records answer `IsTrashed` and `TrashedAt`, and saving one that is trashed must fail validation.
+Trashed records stay out of the ordinary read paths, including relation, back-relation and `@collection` filters, and expanding a relation onto one gives back nothing. To reach them: `App.FindRecordByIdWithTrashed`, `App.FindTrashedRecordById`, `App.FindAllTrashedRecords`. The last two error without the mode. Records answer `IsTrashed` and `TrashedAt`, and saving one that is trashed must fail validation.
 
 Unique indexes need care. With the mode on they must stop counting trashed rows; turning it off must give back exactly the expressions the collection had before. So a later record can take a trashed record's unique value, and restoring the trashed one then has to fail.
 
