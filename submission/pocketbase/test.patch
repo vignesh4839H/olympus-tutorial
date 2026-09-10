@@ -1,9 +1,9 @@
 diff --git a/apis/record_soft_delete_280aff_test.go b/apis/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..c43525c
+index 0000000..fd816cc
 --- /dev/null
 +++ b/apis/record_soft_delete_280aff_test.go
-@@ -0,0 +1,469 @@
+@@ -0,0 +1,457 @@
 +package apis_test
 +
 +import (
@@ -83,8 +83,6 @@ index 0000000..c43525c
 +}
 +
 +func TestSoftDeleteRecordsListApi(t *testing.T) {
-+	t.Parallel()
-+
 +	scenarios := []tests.ApiScenario{
 +		{
 +			Name:           "the trashed records are hidden by default",
@@ -155,8 +153,6 @@ index 0000000..c43525c
 +}
 +
 +func TestSoftDeleteRecordViewApi(t *testing.T) {
-+	t.Parallel()
-+
 +	scenarios := []tests.ApiScenario{
 +		{
 +			Name:           "a trashed record is not viewable",
@@ -206,8 +202,6 @@ index 0000000..c43525c
 +}
 +
 +func TestSoftDeleteRecordDeleteApi(t *testing.T) {
-+	t.Parallel()
-+
 +	scenarios := []tests.ApiScenario{
 +		{
 +			Name:           "deleting moves the record to the trash",
@@ -273,8 +267,6 @@ index 0000000..c43525c
 +}
 +
 +func TestSoftDeleteRecordRestoreApi(t *testing.T) {
-+	t.Parallel()
-+
 +	scenarios := []tests.ApiScenario{
 +		{
 +			Name:           "restoring a trashed record",
@@ -348,8 +340,6 @@ index 0000000..c43525c
 +}
 +
 +func TestSoftDeleteEmptyTrashApi(t *testing.T) {
-+	t.Parallel()
-+
 +	scenarios := []tests.ApiScenario{
 +		{
 +			Name:           "guests cannot empty the trash",
@@ -435,8 +425,6 @@ index 0000000..c43525c
 +}
 +
 +func TestSoftDeleteDeletedFieldIsNotClientWritable(t *testing.T) {
-+	t.Parallel()
-+
 +	scenarios := []tests.ApiScenario{
 +		{
 +			Name:           "the deleted value of a new record is ignored",
@@ -475,10 +463,10 @@ index 0000000..c43525c
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..3416939
+index 0000000..c242bdf
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1299 @@
+@@ -0,0 +1,1243 @@
 +package core_test
 +
 +import (
@@ -583,8 +571,6 @@ index 0000000..3416939
 +// -------------------------------------------------------------------
 +
 +func TestSoftDeleteCollectionSchema(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -647,8 +633,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteCollectionSerialization(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -678,8 +662,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteUniqueIndexRoundTrip(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -711,8 +693,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteTrashRetentionValidation(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -734,8 +714,6 @@ index 0000000..3416939
 +// -------------------------------------------------------------------
 +
 +func TestSoftDeleteTrashesInsteadOfRemoving(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -841,8 +819,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteSecondDeleteIsPermanent(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -869,8 +845,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeletePurgeSkipsTheTrash(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -892,8 +866,6 @@ index 0000000..3416939
 +// -------------------------------------------------------------------
 +
 +func TestSoftDeleteTrashedRecordsCannotBeUpdated(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -931,8 +903,6 @@ index 0000000..3416939
 +// -------------------------------------------------------------------
 +
 +func TestSoftDeleteRestore(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -989,8 +959,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteTrashedUniqueValueIsFreed(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1037,8 +1005,6 @@ index 0000000..3416939
 +// -------------------------------------------------------------------
 +
 +func TestSoftDeleteCascadeTrashAndRestore(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1113,8 +1079,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeletePurgeCascadesPermanently(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1151,8 +1115,6 @@ index 0000000..3416939
 +// -------------------------------------------------------------------
 +
 +func TestSoftDeleteRelationVisibility(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1238,8 +1200,6 @@ index 0000000..3416939
 +// -------------------------------------------------------------------
 +
 +func TestSoftDeletePurgeTrashedRecords(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1289,8 +1249,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeletePurgeExpiredTrashedRecords(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1334,8 +1292,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteSeparateDeletesDoNotShareTimestamp(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1360,8 +1316,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteBackRelationExpand(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1392,8 +1346,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteRestoreRequiresLiveCascadeParent(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1430,8 +1382,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteConflictingDeletedField(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1445,8 +1395,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteTrashedLookupsRequireTheMode(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1464,8 +1412,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteZeroRetentionKeepsTheTrash(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1497,8 +1443,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteMultiValueCascadeNeedsTheLastReference(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1539,8 +1483,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteTogglingKeepsExistingRecords(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1593,8 +1535,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeletePurgeTrashedRecordsWithZeroTime(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1633,8 +1573,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteSecondDeleteCascadesPermanently(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1672,8 +1610,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteCollectionFilterVisibility(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1710,8 +1646,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteOrdinarySaveCannotRestore(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
@@ -1753,8 +1687,6 @@ index 0000000..3416939
 +}
 +
 +func TestSoftDeleteRejectsOwnDeletedField(t *testing.T) {
-+	t.Parallel()
-+
 +	app, _ := tests.NewTestApp()
 +	defer app.Cleanup()
 +
