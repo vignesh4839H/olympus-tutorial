@@ -19,7 +19,7 @@
 
 - **629 meaningful production LOC** added by the solution patch (blank lines,
   comments, imports, braces and test files excluded).
-- **89 graded test cases** across `core` and `apis`.
+- **93 graded test cases** across `core` and `apis`.
 - Verified in a clean checkout of the pinned commit:
   - test patch only -> `./test.sh base` **passes**, `./test.sh new` **fails**
   - test + solution -> `./test.sh base` **passes**, `./test.sh new` **passes**

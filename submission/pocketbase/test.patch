@@ -463,10 +463,10 @@ index 0000000..fd816cc
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..c242bdf
+index 0000000..9bc146e
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1243 @@
+@@ -0,0 +1,1376 @@
 +package core_test
 +
 +import (
@@ -1700,6 +1700,20 @@ index 0000000..c242bdf
 +		}
 +	})
 +
++	t.Run("a system date field added before the mode", func(t *testing.T) {
++		collection := core.NewBaseCollection("sd_own_system_date")
++		collection.Fields.Add(&core.DateField{Name: core.FieldNameDeleted, System: true})
++		if err := app.Save(collection); err != nil {
++			t.Fatal(err)
++		}
++
++		collection.SoftDelete = true
++
++		if err := app.Save(collection); err == nil {
++			t.Fatal("expected a pre-existing system field of the same name to block the mode")
++		}
++	})
++
 +	t.Run("a field of another type", func(t *testing.T) {
 +		collection := core.NewBaseCollection("sd_own_text")
 +		collection.Fields.Add(&core.TextField{Name: core.FieldNameDeleted})
@@ -1709,6 +1723,125 @@ index 0000000..c242bdf
 +			t.Fatal("expected a non-date field of the same name to block the mode")
 +		}
 +	})
++}
++
++func TestSoftDeleteRestoredRecordStaysUsable(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	record := sdNewRecord(t, app, posts, map[string]any{"title": "reused"})
++
++	if err := app.Delete(record); err != nil {
++		t.Fatal(err)
++	}
++
++	trashed, err := app.FindTrashedRecordById(posts, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.RestoreRecord(trashed); err != nil {
++		t.Fatal(err)
++	}
++
++	// the same instance is live now, so an ordinary update of it must go through
++	trashed.Set("title", "changed after restore")
++
++	if err := app.Save(trashed); err != nil {
++		t.Fatalf("expected the restored record to be saveable again, got %v", err)
++	}
++
++	reloaded, err := app.FindRecordById(posts, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if reloaded.GetString("title") != "changed after restore" {
++		t.Fatalf("expected the update to be persisted, got %q", reloaded.GetString("title"))
++	}
++}
++
++func TestSoftDeleteRelationIdFilterHidesTrashed(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	// a relation without cascade, so trashing the post leaves the comment live
++	comments.Fields.Add(&core.RelationField{
++		Name:         "related",
++		CollectionId: posts.Id,
++	})
++	if err := app.Save(comments); err != nil {
++		t.Fatal(err)
++	}
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "target"})
++	comment := sdNewRecord(t, app, comments, map[string]any{"message": "hi", "related": post.Id})
++
++	filter := "related.id = '" + post.Id + "'"
++
++	records, err := app.FindRecordsByFilter(comments, filter, "", 0, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if len(records) != 1 || records[0].Id != comment.Id {
++		t.Fatalf("expected only %q, got %v", comment.Id, sdFindIds(t, records))
++	}
++
++	if err := app.Delete(post); err != nil {
++		t.Fatal(err)
++	}
++
++	// filtering by the stored id must not be a way around the trash
++	records, err = app.FindRecordsByFilter(comments, filter, "", 0, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if len(records) != 0 {
++		t.Fatalf("expected no matches once the target is trashed, got %v", sdFindIds(t, records))
++	}
++}
++
++func TestSoftDeleteKeepsAnUnrelatedIndexOfTheGeneratedName(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	collection := core.NewBaseCollection("sd_index_clash")
++	collection.Fields.Add(&core.TextField{Name: "title"})
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	// an index of the collection's own, sitting on the name this mode generates
++	indexName := "idx_deleted_" + collection.Id
++	collection.AddIndex(indexName, true, "`title`", "")
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	original := collection.GetIndex(indexName)
++	if original == "" {
++		t.Fatal("expected the collection to keep its own index")
++	}
++
++	collection.SoftDelete = true
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	collection.SoftDelete = false
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	if got := collection.GetIndex(indexName); got != original {
++		t.Fatalf("expected the collection's own index to survive as\n%q\ngot\n%q", original, got)
++	}
 +}
 diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
 new file mode 100644
