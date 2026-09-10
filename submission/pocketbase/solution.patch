@@ -31,7 +31,7 @@ index 3f7367f..c2f7096 100644
  
  type BatchRequestResult struct {
 diff --git a/apis/realtime.go b/apis/realtime.go
-index d6d8b58..fe33346 100644
+index d6d8b58..809f592 100644
 --- a/apis/realtime.go
 +++ b/apis/realtime.go
 @@ -440,7 +440,14 @@ func bindRealtimeEvents(app core.App) {
@@ -42,7 +42,7 @@ index d6d8b58..fe33346 100644
 +				// the subscribers never received the record while it was in the
 +				// trash, so from their point of view a restore creates it
 +				action := "update"
-+				if isRestoredRecord(e.Model) {
++				if isRestoredRecord(e.Context, e.Model) {
 +					action = "create"
 +				}
 +
@@ -50,20 +50,23 @@ index d6d8b58..fe33346 100644
  				if err != nil {
  					app.Logger().Debug(
  						"Failed to broadcast record update",
-@@ -591,6 +598,18 @@ type recordData struct {
+@@ -591,6 +598,21 @@ type recordData struct {
  // to be performed against different db app context (e.g. out of a transaction).
  // If set, it is expected that optAccessCheckApp instance is used for read-only operations to avoid deadlocks.
  // If not set, it fallbacks to app.
 +// isRestoredRecord checks whether the just saved model is a record that was
 +// brought back from the trash.
-+func isRestoredRecord(m core.Model) bool {
++//
++// It keys off the save operation rather than the record's original data, which
++// is not refreshed after a save and would otherwise keep reporting every later
++// update of the same instance as a restore.
++func isRestoredRecord(ctx context.Context, m core.Model) bool {
 +	record, ok := m.(*core.Record)
 +	if !ok || !record.Collection().IsSoftDeleteEnabled() {
 +		return false
 +	}
 +
-+	return !record.Original().GetDateTime(core.FieldNameDeleted).IsZero() &&
-+		record.GetDateTime(core.FieldNameDeleted).IsZero()
++	return core.IsRestoreOperation(ctx)
 +}
 +
  func realtimeBroadcastRecord(app core.App, action string, record *core.Record, dryCache bool, optAccessCheckApp ...core.App) error {
@@ -482,25 +485,28 @@ index 1bbec9c..8a47094 100644
  	// If no records are found, returns an empty slice.
  	FindRecordsByIds(collectionModelOrIdentifier any, recordIds []string, optFilters ...func(q *dbx.SelectQuery) error) ([]*Record, error)
 diff --git a/core/base.go b/core/base.go
-index 3d0f41c..a7fef01 100644
+index 3d0f41c..2902c6c 100644
 --- a/core/base.go
 +++ b/core/base.go
-@@ -1348,6 +1348,14 @@ func supportFiles(m Model) bool {
+@@ -1348,6 +1348,17 @@ func supportFiles(m Model) bool {
  	return false
  }
  
-+// isTrashedModel checks whether the model is a record that was moved to the
-+// trash instead of being permanently removed.
++// isTrashedModel checks whether this particular delete moved the record into
++// the trash rather than removing its row.
++//
++// A record loaded out of the trash and then purged is not a transition, so its
++// files must still be cleaned up.
 +func isTrashedModel(m Model) bool {
 +	record, ok := m.(*Record)
 +
-+	return ok && record.IsTrashed()
++	return ok && record.trashTransition
 +}
 +
  func (app *BaseApp) registerBaseHooks() {
  	deletePrefix := func(prefix string) error {
  		fs, err := app.NewFilesystem()
-@@ -1375,7 +1383,9 @@ func (app *BaseApp) registerBaseHooks() {
+@@ -1375,7 +1386,9 @@ func (app *BaseApp) registerBaseHooks() {
  	app.OnModelAfterDeleteSuccess().Bind(&hook.Handler[*ModelEvent]{
  		Id: "__pbFilesManagerDelete__",
  		Func: func(e *ModelEvent) error {
@@ -511,7 +517,7 @@ index 3d0f41c..a7fef01 100644
  				// ensure that there is a trailing slash so that the list iterator could start walking from the prefix dir
  				// (https://github.com/pocketbase/pocketbase/discussions/5246#discussioncomment-10128955)
  				prefix := strings.TrimRight(m.BaseFilesPath(), "/") + "/"
-@@ -1593,6 +1603,13 @@ func (app *BaseApp) initLogger() error {
+@@ -1593,6 +1606,13 @@ func (app *BaseApp) initLogger() error {
  		Priority: -999,
  	})
  
@@ -526,7 +532,7 @@ index 3d0f41c..a7fef01 100644
  	app.Cron().Add("__pbLogsCleanup__", "0 */6 * * *", func() {
  		deleteErr := app.DeleteOldLogs(time.Now().AddDate(0, 0, -1*app.Settings().Logs.MaxDays))
 diff --git a/core/collection_model.go b/core/collection_model.go
-index 2ed040a..8bda543 100644
+index 2ed040a..1336949 100644
 --- a/core/collection_model.go
 +++ b/core/collection_model.go
 @@ -381,6 +381,7 @@ type baseCollection struct {
@@ -602,7 +608,7 @@ index 2ed040a..8bda543 100644
  	case CollectionTypeAuth:
  		c.initIdField()
  		c.initPasswordField()
-@@ -983,6 +1012,138 @@ func (c *Collection) initIdField() {
+@@ -983,6 +1012,142 @@ func (c *Collection) initIdField() {
  	}
  }
  
@@ -624,8 +630,8 @@ index 2ed040a..8bda543 100644
 +	field, _ := existing.(*DateField)
 +	if field == nil {
 +		if existing != nil {
-+			// there is a user defined field with the same name but of a different type
-+			// - leave it untouched and let the collection validator report the conflict
++			// a user defined field is squatting on the name
++			// - leave it alone and let the collection validator report it
 +			return
 +		}
 +
@@ -637,8 +643,12 @@ index 2ed040a..8bda543 100644
 +		return
 +	}
 +
-+	// enforce system defaults
-+	field.System = true
++	if !field.System {
++		// a user defined date field of the same name, not this mode's to take
++		return
++	}
++
++	// enforce the defaults on the field this mode owns
 +	field.Hidden = false
 +	field.Required = false
 +	field.Min = types.DateTime{}
@@ -786,15 +796,20 @@ index 924312b..bf9e708 100644
 +	)
  }
 diff --git a/core/collection_validate.go b/core/collection_validate.go
-index a63b503..3c5f9f3 100644
+index a63b503..84321e5 100644
 --- a/core/collection_validate.go
 +++ b/core/collection_validate.go
-@@ -422,6 +422,29 @@ func (cv *collectionValidator) checkMinFields(value any) error {
+@@ -422,6 +422,34 @@ func (cv *collectionValidator) checkMinFields(value any) error {
  	return nil
  }
  
-+// checkSoftDeleteField ensures that enabling the soft delete mode doesn't
-+// collide with an already existing user defined field with the same name.
++// checkSoftDeleteField ensures that turning the soft delete mode on doesn't
++// collide with a field the collection defines itself.
++//
++// The mode owns the "deleted" field and the index conditions derived from it.
++// Adopting somebody else's field would make those conditions indistinguishable
++// from ones the collection already had, and turning the mode off again would
++// then strip an index expression that was never this mode's to touch.
 +func (validator *collectionValidator) checkSoftDeleteField(value any) error {
 +	enabled, _ := value.(bool)
 +	if !enabled {
@@ -806,10 +821,10 @@ index a63b503..3c5f9f3 100644
 +		return nil
 +	}
 +
-+	if _, ok := field.(*DateField); !ok {
++	if dateField, ok := field.(*DateField); !ok || !dateField.System {
 +		return validation.NewError(
 +			"validation_soft_delete_field_conflict",
-+			`The soft delete mode requires the "`+FieldNameDeleted+`" field to be of type "date".`,
++			`The soft delete mode cannot be enabled while the collection defines its own "`+FieldNameDeleted+`" field.`,
 +		)
 +	}
 +
@@ -819,7 +834,7 @@ index a63b503..3c5f9f3 100644
  func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) error {
  	fields, ok := value.(FieldsList)
  	if !ok {
-@@ -437,6 +460,12 @@ func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) erro
+@@ -437,6 +465,12 @@ func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) erro
  			continue
  		}
  
@@ -832,7 +847,7 @@ index a63b503..3c5f9f3 100644
  		newField := fields.GetById(oldField.GetId())
  
  		if newField == nil || oldField.GetName() != newField.GetName() {
-@@ -692,6 +721,8 @@ func (validator *collectionValidator) validateOptions() error {
+@@ -692,6 +726,8 @@ func (validator *collectionValidator) validateOptions() error {
  		return validator.new.collectionAuthOptions.validate(validator)
  	case CollectionTypeView:
  		return validator.new.collectionViewOptions.validate(validator)
@@ -920,21 +935,32 @@ index 425cc5e..c44c206 100644
  	// replace existing
  	for i, j := range r.listRuleJoins {
 diff --git a/core/record_model.go b/core/record_model.go
-index b654864..ce538e5 100644
+index b654864..7400f21 100644
 --- a/core/record_model.go
 +++ b/core/record_model.go
-@@ -1425,6 +1425,10 @@ func (m *Record) callFieldInterceptors(
+@@ -50,6 +50,10 @@ type Record struct {
+ 	exportCustomData      bool
+ 	ignoreEmailVisibility bool
+ 	ignoreUnchangedFields bool
++
++	// trashTransition marks the single delete that moved this record into
++	// the trash, as opposed to a record that was merely loaded from it.
++	trashTransition bool
+ }
+ 
+ const systemHookIdRecord = "__pbRecordSystemHook__"
+@@ -1425,6 +1429,10 @@ func (m *Record) callFieldInterceptors(
  }
  
  func onRecordValidate(e *RecordEvent) error {
-+	if err := checkTrashedRecordUpdate(e.Record); err != nil {
++	if err := checkTrashedRecordUpdate(e.Context, e.Record); err != nil {
 +		return err
 +	}
 +
  	errs := validation.Errors{}
  
  	for _, f := range e.Record.Collection().Fields {
-@@ -1488,6 +1492,16 @@ func onRecordSaveExecute(e *RecordEvent) error {
+@@ -1488,6 +1496,16 @@ func onRecordSaveExecute(e *RecordEvent) error {
  }
  
  func onRecordDeleteExecute(e *RecordEvent) error {
@@ -951,7 +977,7 @@ index b654864..ce538e5 100644
  	// fetch rel references (if any)
  	//
  	// note: the select is outside of the transaction to minimize
-@@ -1507,57 +1521,77 @@ func onRecordDeleteExecute(e *RecordEvent) error {
+@@ -1507,57 +1525,77 @@ func onRecordDeleteExecute(e *RecordEvent) error {
  			return err
  		}
  
@@ -1056,7 +1082,7 @@ index b654864..ce538e5 100644
  
  			// trigger cascade for each batchSize rel items until there is none
  			batchSize := 8000
-@@ -1573,7 +1607,7 @@ func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Fie
+@@ -1573,7 +1611,7 @@ func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Fie
  					break
  				}
  
@@ -1065,7 +1091,7 @@ index b654864..ce538e5 100644
  				if err != nil {
  					return err
  				}
-@@ -1595,14 +1629,16 @@ func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Fie
+@@ -1595,14 +1633,16 @@ func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Fie
  // just unset the record id from any relation field values (if they are not required).
  //
  // NB! This method is expected to be called from inside of a transaction.
@@ -1084,7 +1110,7 @@ index b654864..ce538e5 100644
  		if err != nil {
  			if errors.Is(err, sql.ErrNoRows) {
  				continue // already deleted
-@@ -1623,7 +1659,7 @@ func deleteRefRecords(app App, mainRecord *Record, refCollection *Collection, re
+@@ -1623,7 +1663,7 @@ func deleteRefRecords(app App, mainRecord *Record, refCollection *Collection, re
  		// cascade delete the reference
  		// (only if there are no other active references in case of multiple select)
  		if relField.CascadeDelete && len(ids) == 0 {
@@ -1270,10 +1296,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..7bda3cc
+index 0000000..077ac89
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,566 @@
+@@ -0,0 +1,600 @@
 +package core
 +
 +import (
@@ -1343,6 +1369,33 @@ index 0000000..7bda3cc
 +	lastTrashTimestamp = now
 +
 +	return now
++}
++
++// restoreContextKey marks the single save performed by RestoreRecord, so that
++// clearing the trash stamp cannot be done through an ordinary save.
++type restoreContextKey struct{}
++
++// withRestoreContext returns a copy of ctx marked as a restore.
++func withRestoreContext(ctx context.Context) context.Context {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++
++	return context.WithValue(ctx, restoreContextKey{}, true)
++}
++
++// IsRestoreOperation reports whether ctx belongs to a record restore.
++//
++// It is true only for the save issued by [App.RestoreRecord], so callers can
++// tell a record coming back from the trash from any later update of it.
++func IsRestoreOperation(ctx context.Context) bool {
++	if ctx == nil {
++		return false
++	}
++
++	enabled, _ := ctx.Value(restoreContextKey{}).(bool)
++
++	return enabled
 +}
 +
 +// trashTimestampContextKey is the context key carrying the trash timestamp
@@ -1465,6 +1518,7 @@ index 0000000..7bda3cc
 +	// hooks (and the caller) can tell a trashed record from a removed one
 +	e.Record.SetRaw(FieldNameDeleted, trashedAt)
 +	e.Record.originalData[FieldNameDeleted] = trashedAt
++	e.Record.trashTransition = true
 +
 +	return nil
 +}
@@ -1644,7 +1698,11 @@ index 0000000..7bda3cc
 +
 +// checkTrashedRecordUpdate ensures that a record sitting in the trash is not
 +// modified by anything other than a restore.
-+func checkTrashedRecordUpdate(record *Record) error {
++//
++// The decision is made from the operation, not from the submitted value:
++// letting any save that happens to clear the trash stamp through would turn
++// an ordinary update into a second, unchecked restore path.
++func checkTrashedRecordUpdate(ctx context.Context, record *Record) error {
 +	if record.IsNew() || !record.Collection().IsSoftDeleteEnabled() {
 +		return nil
 +	}
@@ -1653,8 +1711,8 @@ index 0000000..7bda3cc
 +		return nil // the persisted record is not trashed
 +	}
 +
-+	if record.GetDateTime(FieldNameDeleted).IsZero() {
-+		return nil // the trash timestamp is being cleared, aka. a restore
++	if IsRestoreOperation(ctx) {
++		return nil
 +	}
 +
 +	return validation.Errors{
@@ -1743,10 +1801,12 @@ index 0000000..7bda3cc
 +		return err
 +	}
 +
++	restoreCtx := withRestoreContext(ctx)
++
 +	return app.RunInTransaction(func(txApp App) error {
 +		record.Set(FieldNameDeleted, "")
 +
-+		if err := txApp.SaveWithContext(ctx, record); err != nil {
++		if err := txApp.SaveWithContext(restoreCtx, record); err != nil {
 +			return err
 +		}
 +

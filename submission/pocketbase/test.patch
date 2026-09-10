@@ -475,10 +475,10 @@ index 0000000..c43525c
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..517d1cf
+index 0000000..3416939
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1229 @@
+@@ -0,0 +1,1299 @@
 +package core_test
 +
 +import (
@@ -1708,6 +1708,76 @@ index 0000000..517d1cf
 +		t.Fatalf("expected no matches once the post is trashed, got %v", sdFindIds(t, records))
 +	}
 +}
++
++func TestSoftDeleteOrdinarySaveCannotRestore(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "parent"})
++	comment := sdNewRecord(t, app, comments, map[string]any{"message": "child", "post": post.Id})
++
++	if err := app.Delete(post); err != nil {
++		t.Fatal(err)
++	}
++
++	trashed, err := app.FindTrashedRecordById(comments, comment.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// clearing the stamp by hand must not become a second restore path,
++	// least of all one that skips the cascade parent check
++	trashed.Set(core.FieldNameDeleted, "")
++	trashed.Set("message", "sneaked back")
++
++	if err := app.Save(trashed); err == nil {
++		t.Fatal("expected an ordinary save to be refused for a trashed record")
++	}
++
++	if _, err := app.FindRecordById(comments, comment.Id); !errors.Is(err, sql.ErrNoRows) {
++		t.Fatalf("expected the comment to stay in the trash, got %v", err)
++	}
++
++	reloaded, err := app.FindTrashedRecordById(comments, comment.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if reloaded.GetString("message") != "child" {
++		t.Fatalf("expected the message to be unchanged, got %q", reloaded.GetString("message"))
++	}
++}
++
++func TestSoftDeleteRejectsOwnDeletedField(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	t.Run("a date field of the same name", func(t *testing.T) {
++		collection := core.NewBaseCollection("sd_own_date")
++		collection.Fields.Add(&core.DateField{Name: core.FieldNameDeleted})
++		collection.SoftDelete = true
++
++		if err := app.Save(collection); err == nil {
++			t.Fatal("expected the collection's own date field to block the mode")
++		}
++	})
++
++	t.Run("a field of another type", func(t *testing.T) {
++		collection := core.NewBaseCollection("sd_own_text")
++		collection.Fields.Add(&core.TextField{Name: core.FieldNameDeleted})
++		collection.SoftDelete = true
++
++		if err := app.Save(collection); err == nil {
++			t.Fatal("expected a non-date field of the same name to block the mode")
++		}
++	})
++}
 diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
 new file mode 100644
 index 0000000..4f7ac2f
@@ -1954,7 +2024,7 @@ index 0000000..4f7ac2f
 +}
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..cb2db9c
+index 0000000..6d0be26
 --- /dev/null
 +++ b/test.sh
 @@ -0,0 +1,56 @@
@@ -1993,7 +2063,7 @@ index 0000000..cb2db9c
 +
 +case "$MODE" in
 +  base)
-+    PACKAGES=(./forms/ ./mails/ ./plugins/migratecmd/ ./tools/...)
++    PACKAGES=(./forms/ ./mails/ ./tools/search/ ./tools/dbutils/ ./tools/inflector/ ./tools/list/ ./tools/picker/)
 +    ;;
 +  new)
 +    PACKAGES=(./core/ ./apis/)
