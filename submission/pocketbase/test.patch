@@ -463,10 +463,10 @@ index 0000000..fd816cc
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..cf5e794
+index 0000000..b330a9e
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1482 @@
+@@ -0,0 +1,1608 @@
 +package core_test
 +
 +import (
@@ -1948,6 +1948,132 @@ index 0000000..cf5e794
 +	if reloaded.GetString(core.FieldNameDeleted) != "written by the client" {
 +		t.Fatalf("expected the client value to be written, got %q", reloaded.GetString(core.FieldNameDeleted))
 +	}
++}
++
++func TestSoftDeleteBareRelationFilterHidesTrashed(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	// a relation without cascade, so trashing the post leaves the comment live
++	comments.Fields.Add(&core.RelationField{
++		Name:         "related",
++		CollectionId: posts.Id,
++	})
++	if err := app.Save(comments); err != nil {
++		t.Fatal(err)
++	}
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "target"})
++	comment := sdNewRecord(t, app, comments, map[string]any{"message": "hi", "related": post.Id})
++
++	// the bare relation name must behave exactly like "related.id"
++	filter := "related = '" + post.Id + "'"
++
++	records, err := app.FindRecordsByFilter(comments, filter, "", 0, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if len(records) != 1 || records[0].Id != comment.Id {
++		t.Fatalf("expected only %q, got %v", comment.Id, sdFindIds(t, records))
++	}
++
++	if err := app.Delete(post); err != nil {
++		t.Fatal(err)
++	}
++
++	records, err = app.FindRecordsByFilter(comments, filter, "", 0, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if len(records) != 0 {
++		t.Fatalf("expected no matches once the target is trashed, got %v", sdFindIds(t, records))
++	}
++
++	// with the target gone the relation reads as unset
++	records, err = app.FindRecordsByFilter(comments, "related = ''", "", 0, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if len(records) != 1 || records[0].Id != comment.Id {
++		t.Fatalf("expected the relation to read as empty, got %v", sdFindIds(t, records))
++	}
++
++	// restoring the post brings the match back
++	if err := app.RestoreRecord(post); err != nil {
++		t.Fatal(err)
++	}
++
++	records, err = app.FindRecordsByFilter(comments, filter, "", 0, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if len(records) != 1 || records[0].Id != comment.Id {
++		t.Fatalf("expected the match to come back after a restore, got %v", sdFindIds(t, records))
++	}
++}
++
++func TestSoftDeleteMultiRelationFilterHidesTrashed(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	comments.Fields.Add(&core.RelationField{
++		Name:         "targets",
++		CollectionId: posts.Id,
++		MaxSelect:    5,
++	})
++	if err := app.Save(comments); err != nil {
++		t.Fatal(err)
++	}
++
++	first := sdNewRecord(t, app, posts, map[string]any{"title": "first"})
++	second := sdNewRecord(t, app, posts, map[string]any{"title": "second"})
++	comment := sdNewRecord(t, app, comments, map[string]any{
++		"message": "hi",
++		"targets": []string{first.Id, second.Id},
++	})
++
++	assertMatches := func(label string, filter string, expected int) {
++		t.Helper()
++
++		records, err := app.FindRecordsByFilter(comments, filter, "", 0, 0)
++		if err != nil {
++			t.Fatalf("%s: %v", label, err)
++		}
++
++		if len(records) != expected {
++			t.Fatalf("%s: expected %d match(es), got %v", label, expected, sdFindIds(t, records))
++		}
++
++		if expected > 0 && records[0].Id != comment.Id {
++			t.Fatalf("%s: expected %q, got %v", label, comment.Id, sdFindIds(t, records))
++		}
++	}
++
++	assertMatches("bare before", "targets ?= '"+first.Id+"'", 1)
++	assertMatches("each before", "targets:each ?= '"+first.Id+"'", 1)
++	assertMatches("length before", "targets:length = 2", 1)
++
++	if err := app.Delete(first); err != nil {
++		t.Fatal(err)
++	}
++
++	assertMatches("bare after", "targets ?= '"+first.Id+"'", 0)
++	assertMatches("each after", "targets:each ?= '"+first.Id+"'", 0)
++
++	// the trashed target must not be counted anymore
++	assertMatches("stale length after", "targets:length = 2", 0)
++	assertMatches("length after", "targets:length = 1", 1)
++
++	// the still live target keeps matching
++	assertMatches("live sibling", "targets ?= '"+second.Id+"'", 1)
 +}
 diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
 new file mode 100644

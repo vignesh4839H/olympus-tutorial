@@ -17,9 +17,9 @@
 
 ## Measured results
 
-- **629 meaningful production LOC** added by the solution patch (blank lines,
+- **715 meaningful production LOC** added by the solution patch (blank lines,
   comments, imports, braces and test files excluded).
-- **96 graded test cases** across `core` and `apis`.
+- **98 graded test cases** across `core` and `apis`.
 - Verified in a clean checkout of the pinned commit:
   - test patch only -> `./test.sh base` **passes**, `./test.sh new` **fails**
   - test + solution -> `./test.sh base` **passes**, `./test.sh new` **passes**
@@ -52,6 +52,9 @@ The difficulty lives in the interactions:
 
 - `RecordQuery` is the base of every read path, so the exclusion has to be
   correct there and opt-out-able for the trash views.
+- A filter naming a relation compares the stored foreign key without touching
+  the related table, so both `rel` and `rel.id` have to be rerouted through the
+  filtered join once the target collection can hide rows.
 - Unique indexes have to become partial while the mode is on and revert exactly
   when it is off, otherwise a trashed row blocks its own replacement.
 - Trashing cascades through `CascadeDelete` relations and a restore has to
@@ -64,7 +67,7 @@ The difficulty lives in the interactions:
 
 ## Files touched by the solution
 
-17 files, 1984 diff lines:
+18 files, 2520 diff lines:
 
 `core/record_trash.go` (new), `core/record_query.go`, `core/collection_model.go`,
 `core/record_model.go`, `core/collection_validate.go`,
@@ -72,14 +75,19 @@ The difficulty lives in the interactions:
 `core/record_field_resolver.go`, `core/record_field_resolver_runner.go`,
 `core/record_query_expand.go`, `core/app.go`, `core/base.go`, `core/field.go`,
 `apis/record_crud.go`, `apis/realtime.go`, `apis/batch.go`,
-`forms/record_upsert.go`. Test files live in the test patch.
+`forms/record_upsert.go`, `plugins/jsvm/internal/types/generated/types.d.ts`.
+Test files live in the test patch.
 
-`plugins/jsvm/internal/types/generated/types.d.ts` is deliberately **not** in the
-patch. `make jstypes` rewrites that file with randomized type-alias names and a
-unix-timestamp header on every run, so regenerating it produced 13878 changed
-lines of which only about 90 were soft delete related. Including it would make
-the patch non-deterministic and unreviewable; it is a generated artifact that the
-build does not depend on.
+### The JSVM declaration file
+
+`make jstypes` rewrites `types.d.ts` with randomized type-alias names, a
+unix-timestamp header and a different namespace order on every run: a straight
+regeneration produced 13878 changed lines of which only about 90 were soft
+delete related. The file in the patch is therefore the generator's output for
+the new declarations only, spliced into the committed file so the diff is the
+245 lines that actually describe the feature (the collection options and
+`isSoftDeleteEnabled`, `Record.isTrashed` / `trashedAt`, and the new app query,
+restore and purge methods) and nothing else.
 
 ## Sibling directory
 
