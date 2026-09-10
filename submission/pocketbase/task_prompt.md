@@ -6,9 +6,9 @@ Delete a record that is already trashed and it goes for good. `App.PurgeRecord` 
 
 Trashed records stay out of the ordinary read paths, including relation, back-relation and `@collection` filters, and expanding a relation onto one gives back nothing. To reach them: `App.FindRecordByIdWithTrashed`, `App.FindTrashedRecordById`, `App.FindAllTrashedRecords`. The last two error without the mode. Records answer `IsTrashed` and `TrashedAt`, and saving one that is trashed must fail validation.
 
-Unique indexes need care. With the mode on they must stop counting trashed rows; turning it off must give back exactly the expressions the collection had before.
+With the mode on the collection's unique indexes must stop counting trashed rows; turning it off must give back exactly the expressions it had before.
 
-Trashing cascades. Records pointing at it through a cascade-delete relation go too, recursively, though their relation values stay put. Where a relation holds several values, it follows only if the trashed record was the last visible thing it pointed at. Everything caught by a single delete shares one timestamp, and two separate deletes must never share one, because that group is what `App.RestoreRecord` brings back. Restoring an untrashed record does nothing, restoring without the mode is an error, and nothing can be restored while something it cascade-depends on is still trashed.
+Records pointing at a trashed record through a cascade-delete relation go too, recursively, though their relation values stay put. Where a relation holds several values, it follows only if the trashed record was the last visible thing it pointed at. Everything caught by a single delete shares one timestamp, and two separate deletes must never share one, because that group is what `App.RestoreRecord` brings back. Restoring an untrashed record does nothing, restoring without the mode is an error, and nothing can be restored while something it cascade-depends on is still trashed.
 
 `App.PurgeTrashedRecords` clears a collection's records trashed before some time and reports how many went. Pass the zero time to empty the lot. A collection without the mode is an error. `App.PurgeExpiredTrashedRecords` applies each collection's retention, skipping any without one.
 
