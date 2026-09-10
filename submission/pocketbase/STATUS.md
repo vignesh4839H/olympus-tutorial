@@ -64,12 +64,22 @@ The difficulty lives in the interactions:
 
 ## Files touched by the solution
 
+17 files, 1984 diff lines:
+
 `core/record_trash.go` (new), `core/record_query.go`, `core/collection_model.go`,
 `core/record_model.go`, `core/collection_validate.go`,
-`core/collection_model_base_options.go`, `core/record_field_resolver.go`,
+`core/collection_model_base_options.go`, `core/collection_record_table_sync.go`,
+`core/record_field_resolver.go`, `core/record_field_resolver_runner.go`,
 `core/record_query_expand.go`, `core/app.go`, `core/base.go`, `core/field.go`,
 `apis/record_crud.go`, `apis/realtime.go`, `apis/batch.go`,
-`forms/record_upsert.go`, (test files live in the test patch).
+`forms/record_upsert.go`. Test files live in the test patch.
+
+`plugins/jsvm/internal/types/generated/types.d.ts` is deliberately **not** in the
+patch. `make jstypes` rewrites that file with randomized type-alias names and a
+unix-timestamp header on every run, so regenerating it produced 13878 changed
+lines of which only about 90 were soft delete related. Including it would make
+the patch non-deterministic and unreviewable; it is a generated artifact that the
+build does not depend on.
 
 ## Sibling directory
 
