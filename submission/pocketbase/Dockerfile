@@ -10,6 +10,8 @@ ENV GOTOOLCHAIN=go1.27.0
 
 RUN go version
 
+RUN test -f go.mod && test -f go.sum
+
 RUN go mod download
 
 RUN go mod verify
