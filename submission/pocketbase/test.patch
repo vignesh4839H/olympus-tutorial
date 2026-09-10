@@ -475,10 +475,10 @@ index 0000000..c43525c
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..b0d9ef0
+index 0000000..517d1cf
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1152 @@
+@@ -0,0 +1,1229 @@
 +package core_test
 +
 +import (
@@ -1629,6 +1629,83 @@ index 0000000..b0d9ef0
 +
 +	if !sdRawExists(t, app, posts, kept.Id) {
 +		t.Fatal("expected the live record row to be kept")
++	}
++}
++
++func TestSoftDeleteSecondDeleteCascadesPermanently(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "twice over"})
++	comment := sdNewRecord(t, app, comments, map[string]any{"message": "child", "post": post.Id})
++
++	// the first delete only moves the pair into the trash
++	if err := app.Delete(post); err != nil {
++		t.Fatal(err)
++	}
++
++	if !sdRawExists(t, app, comments, comment.Id) {
++		t.Fatal("expected the cascaded comment row to be kept by the first delete")
++	}
++
++	trashed, err := app.FindTrashedRecordById(posts, post.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// the second one takes the whole group for good
++	if err := app.Delete(trashed); err != nil {
++		t.Fatal(err)
++	}
++
++	if sdRawExists(t, app, posts, post.Id) {
++		t.Fatal("expected the post row to be removed")
++	}
++
++	if sdRawExists(t, app, comments, comment.Id) {
++		t.Fatal("expected the trashed comment row to be removed as well")
++	}
++}
++
++func TestSoftDeleteCollectionFilterVisibility(t *testing.T) {
++	t.Parallel()
++
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "findable"})
++
++	// no relation to the post, so it is not carried along by the cascade
++	comment := sdNewRecord(t, app, comments, map[string]any{"message": "standalone"})
++
++	filter := "@collection.sd_posts.title = 'findable'"
++
++	records, err := app.FindRecordsByFilter(comments, filter, "", 0, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if len(records) != 1 || records[0].Id != comment.Id {
++		t.Fatalf("expected only %q, got %v", comment.Id, sdFindIds(t, records))
++	}
++
++	if err := app.Delete(post); err != nil {
++		t.Fatal(err)
++	}
++
++	records, err = app.FindRecordsByFilter(comments, filter, "", 0, 0)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if len(records) != 0 {
++		t.Fatalf("expected no matches once the post is trashed, got %v", sdFindIds(t, records))
 +	}
 +}
 diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
