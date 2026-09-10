@@ -463,10 +463,10 @@ index 0000000..fd816cc
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..9bc146e
+index 0000000..cf5e794
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1376 @@
+@@ -0,0 +1,1482 @@
 +package core_test
 +
 +import (
@@ -478,6 +478,7 @@ index 0000000..9bc146e
 +
 +	"github.com/pocketbase/dbx"
 +	"github.com/pocketbase/pocketbase/core"
++	"github.com/pocketbase/pocketbase/forms"
 +	"github.com/pocketbase/pocketbase/tests"
 +	"github.com/pocketbase/pocketbase/tools/types"
 +)
@@ -1841,6 +1842,111 @@ index 0000000..9bc146e
 +
 +	if got := collection.GetIndex(indexName); got != original {
 +		t.Fatalf("expected the collection's own index to survive as\n%q\ngot\n%q", original, got)
++	}
++}
++
++func TestSoftDeleteGeneratedFieldCannotBeReplaced(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	// drop the generated field and put a field of another type in its place
++	posts.Fields.RemoveByName(core.FieldNameDeleted)
++	posts.Fields.Add(&core.TextField{Name: core.FieldNameDeleted})
++
++	err := app.Save(posts)
++
++	reloaded, findErr := app.FindCollectionByNameOrId("sd_posts")
++	if findErr != nil {
++		t.Fatal(findErr)
++	}
++
++	if !reloaded.SoftDelete {
++		t.Fatal("expected the collection to still have the mode enabled")
++	}
++
++	field, _ := reloaded.Fields.GetByName(core.FieldNameDeleted).(*core.DateField)
++	if field == nil || !field.System {
++		t.Fatalf("expected the generated system date field to survive, got %#v (save err: %v)", reloaded.Fields.GetByName(core.FieldNameDeleted), err)
++	}
++}
++
++func TestSoftDeleteUniqueIndexTextIsUntouched(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	collection := core.NewBaseCollection("sd_raw_index")
++	collection.Fields.Add(&core.TextField{Name: "title"})
++	// deliberately unquoted and loosely spaced, the way somebody would type it
++	collection.Indexes = []string{"CREATE UNIQUE INDEX idx_sd_raw_title ON sd_raw_index (title)"}
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	original := collection.GetIndex("idx_sd_raw_title")
++
++	collection.SoftDelete = true
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	if during := collection.GetIndex("idx_sd_raw_title"); during != original {
++		t.Fatalf("expected the stored expression to be left alone, got\n%q", during)
++	}
++
++	// and the constraint still has to ignore the trashed rows
++	first := sdNewRecord(t, app, collection, map[string]any{"title": "same"})
++	if err := app.Delete(first); err != nil {
++		t.Fatal(err)
++	}
++	second := sdNewRecord(t, app, collection, map[string]any{"title": "same"})
++
++	// the trashed row becomes an ordinary one again once the mode is off, so
++	// clear it before toggling or the plain constraint would rightly refuse
++	if err := app.PurgeRecord(second); err != nil {
++		t.Fatal(err)
++	}
++
++	collection.SoftDelete = false
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	if after := collection.GetIndex("idx_sd_raw_title"); after != original {
++		t.Fatalf("expected exactly\n%q\ngot\n%q", original, after)
++	}
++}
++
++func TestSoftDeleteOffKeepsAnOrdinaryDeletedField(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	collection := core.NewBaseCollection("sd_plain_deleted")
++	collection.Fields.Add(&core.TextField{Name: core.FieldNameDeleted})
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	if collection.Fields.GetByName(core.FieldNameDeleted) == nil {
++		t.Fatal("expected the collection to keep its own field while the mode is off")
++	}
++
++	record := core.NewRecord(collection)
++	form := forms.NewRecordUpsert(app, record)
++	form.Load(map[string]any{core.FieldNameDeleted: "written by the client"})
++
++	if err := form.Submit(); err != nil {
++		t.Fatal(err)
++	}
++
++	reloaded, err := app.FindRecordById(collection, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if reloaded.GetString(core.FieldNameDeleted) != "written by the client" {
++		t.Fatalf("expected the client value to be written, got %q", reloaded.GetString(core.FieldNameDeleted))
 +	}
 +}
 diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
