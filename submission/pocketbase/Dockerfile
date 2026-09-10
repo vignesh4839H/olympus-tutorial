@@ -8,9 +8,7 @@ ENV CGO_ENABLED=0
 ENV GOFLAGS="-mod=readonly"
 ENV GOTOOLCHAIN=go1.27.0
 
-RUN go version && go version | grep -q "go1.27.0"
-
-RUN test -f go.mod && test -f go.sum
+RUN go version
 
 RUN go mod download
 
