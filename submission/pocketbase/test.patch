@@ -463,10 +463,10 @@ index 0000000..fd816cc
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..b330a9e
+index 0000000..cce2faa
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1608 @@
+@@ -0,0 +1,1757 @@
 +package core_test
 +
 +import (
@@ -2074,6 +2074,155 @@ index 0000000..b330a9e
 +
 +	// the still live target keeps matching
 +	assertMatches("live sibling", "targets ?= '"+second.Id+"'", 1)
++}
++
++// sdDependencyChain builds three soft delete collections where a single delete
++// produces a group whose members cascade-depend on each other:
++//
++//	sd_dep_child -> sd_dep_middle -> sd_dep_root
++//	sd_dep_child -> sd_dep_root
++//
++// Collection name order reaches the child before the middle record, so a
++// restore that walks the group in that order sees a dependency that is still
++// in the trash.
++func sdDependencyChain(t testing.TB, app core.App) (*core.Collection, *core.Collection, *core.Collection) {
++	t.Helper()
++
++	root := core.NewBaseCollection("sd_dep_root")
++	root.SoftDelete = true
++	root.Fields.Add(&core.TextField{Name: "title"})
++	if err := app.Save(root); err != nil {
++		t.Fatal(err)
++	}
++
++	middle := core.NewBaseCollection("sd_dep_middle")
++	middle.SoftDelete = true
++	middle.Fields.Add(&core.RelationField{Name: "root", CollectionId: root.Id, CascadeDelete: true})
++	if err := app.Save(middle); err != nil {
++		t.Fatal(err)
++	}
++
++	child := core.NewBaseCollection("sd_dep_child")
++	child.SoftDelete = true
++	child.Fields.Add(&core.RelationField{Name: "root", CollectionId: root.Id, CascadeDelete: true})
++	child.Fields.Add(&core.RelationField{Name: "middle", CollectionId: middle.Id, CascadeDelete: true})
++	if err := app.Save(child); err != nil {
++		t.Fatal(err)
++	}
++
++	return root, middle, child
++}
++
++func TestSoftDeleteRestoreGroupIgnoresMemberOrder(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	root, middle, child := sdDependencyChain(t, app)
++
++	rootRecord := sdNewRecord(t, app, root, map[string]any{"title": "root"})
++	middleRecord := sdNewRecord(t, app, middle, map[string]any{"root": rootRecord.Id})
++	childRecord := sdNewRecord(t, app, child, map[string]any{
++		"root":   rootRecord.Id,
++		"middle": middleRecord.Id,
++	})
++
++	if err := app.Delete(rootRecord); err != nil {
++		t.Fatal(err)
++	}
++
++	all := []*core.Record{rootRecord, middleRecord, childRecord}
++
++	// the single delete must produce one group
++	var stamp string
++	for _, record := range all {
++		trashed, err := app.FindRecordByIdWithTrashed(record.Collection(), record.Id)
++		if err != nil {
++			t.Fatalf("%s: %v", record.Collection().Name, err)
++		}
++
++		if !trashed.IsTrashed() {
++			t.Fatalf("expected the %s record to be trashed", record.Collection().Name)
++		}
++
++		if stamp == "" {
++			stamp = trashed.TrashedAt().String()
++		} else if trashed.TrashedAt().String() != stamp {
++			t.Fatalf("expected one shared timestamp, got %q and %q", stamp, trashed.TrashedAt().String())
++		}
++	}
++
++	trashedRoot, err := app.FindTrashedRecordById(root, rootRecord.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// a member depending on another member must not block the group
++	if err := app.RestoreRecord(trashedRoot); err != nil {
++		t.Fatalf("expected the group to be restorable, got %v", err)
++	}
++
++	for _, record := range all {
++		if _, err := app.FindRecordById(record.Collection(), record.Id); err != nil {
++			t.Fatalf("expected the %s record to come back, got %v", record.Collection().Name, err)
++		}
++	}
++}
++
++func TestSoftDeleteRestoreStillRejectsDependenciesOutsideTheGroup(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	root, middle, child := sdDependencyChain(t, app)
++
++	rootRecord := sdNewRecord(t, app, root, map[string]any{"title": "root"})
++	middleRecord := sdNewRecord(t, app, middle, map[string]any{"root": rootRecord.Id})
++	childRecord := sdNewRecord(t, app, child, map[string]any{
++		"root":   rootRecord.Id,
++		"middle": middleRecord.Id,
++	})
++
++	// trashing the child on its own puts it in a group of its own
++	if err := app.Delete(childRecord); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.Delete(middleRecord); err != nil {
++		t.Fatal(err)
++	}
++
++	trashedChild, err := app.FindTrashedRecordById(child, childRecord.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// the middle record was trashed separately, so it is not part of the
++	// child's group and must still block the restore
++	if err := app.RestoreRecord(trashedChild); err == nil {
++		t.Fatal("expected an error when a cascade dependency outside the group is still trashed")
++	}
++
++	if _, err := app.FindRecordById(child, childRecord.Id); err == nil {
++		t.Fatal("expected the child to stay in the trash after the rejected restore")
++	}
++
++	trashedMiddle, err := app.FindTrashedRecordById(middle, middleRecord.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.RestoreRecord(trashedMiddle); err != nil {
++		t.Fatal(err)
++	}
++
++	// with the dependency live again the child restores on its own
++	trashedChild, err = app.FindTrashedRecordById(child, childRecord.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.RestoreRecord(trashedChild); err != nil {
++		t.Fatalf("expected the child to be restorable once its dependency is live, got %v", err)
++	}
 +}
 diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
 new file mode 100644

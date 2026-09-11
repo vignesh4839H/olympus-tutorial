@@ -17,9 +17,9 @@
 
 ## Measured results
 
-- **715 meaningful production LOC** added by the solution patch (blank lines,
+- **738 meaningful production LOC** added by the solution patch (blank lines,
   comments, imports, braces and test files excluded).
-- **98 graded test cases** across `core` and `apis`.
+- **100 graded test cases** across `core` and `apis`.
 - Verified in a clean checkout of the pinned commit:
   - test patch only -> `./test.sh base` **passes**, `./test.sh new` **fails**
   - test + solution -> `./test.sh base` **passes**, `./test.sh new` **passes**
@@ -60,6 +60,11 @@ The difficulty lives in the interactions:
 - Trashing cascades through `CascadeDelete` relations and a restore has to
   bring back exactly that group, which requires the group timestamp to be
   unique per delete operation.
+- A restore group is a dependency graph, not a list: one member can
+  cascade-depend on another, so the group has to be collected and validated as
+  a whole before anything is written. Validating each member as it is reached
+  makes the visit order observable and can leave a valid group permanently
+  unrestorable.
 - Permanent deletion keeps the existing cascade, including through records that
   are themselves in the trash.
 - Collections that do not enable the mode must serialize byte-identically to
@@ -67,7 +72,7 @@ The difficulty lives in the interactions:
 
 ## Files touched by the solution
 
-18 files, 2520 diff lines:
+18 files, 2576 diff lines:
 
 `core/record_trash.go` (new), `core/record_query.go`, `core/collection_model.go`,
 `core/record_model.go`, `core/collection_validate.go`,
