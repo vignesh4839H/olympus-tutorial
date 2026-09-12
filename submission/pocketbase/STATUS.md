@@ -123,3 +123,6 @@ Either `auto` or an exact pin works. Downgrading `go.mod` is not an option: it
 would fail on the missing stdlib package instead, and it would mean editing
 upstream code at a fixed commit.
 
+The module files are copied and the dependencies downloaded before the rest of
+the source, so the download layer is reused whenever only code changes.
+
