@@ -6,7 +6,7 @@ COPY . .
 
 ENV CGO_ENABLED=0
 ENV GOFLAGS="-mod=readonly"
-ENV GOTOOLCHAIN=go1.27.0
+ENV GOTOOLCHAIN=auto
 
 RUN go version
 

@@ -101,3 +101,15 @@ every precheck but was **rejected at the Scope Gate as publicly-solved**:
 `DHowett/go-plist` implements the same codec. Kept as a record of what the gate
 rejects and why. This feature has no such public equivalent — the hard part is
 PocketBase's own collection, record, query and cascade machinery.
+
+## Dockerfile note
+
+The base image ships Go 1.26.3 with `GOTOOLCHAIN=local`, while the pinned
+commit's `go.mod` requires Go 1.27 (the repository imports the `encoding/json/v2`
+stdlib package in more than ten files). The Dockerfile therefore has to override
+`GOTOOLCHAIN`; without that line the build fails with
+`go: go.mod requires go >= 1.27 (running go 1.26.3; GOTOOLCHAIN=local)`.
+Either `auto` or an exact pin works. Downgrading `go.mod` is not an option: it
+would fail on the missing stdlib package instead, and it would mean editing
+upstream code at a fixed commit.
+
