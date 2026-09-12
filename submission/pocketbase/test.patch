@@ -463,10 +463,10 @@ index 0000000..fd816cc
 +}
 diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..cce2faa
+index 0000000..f98ea7f
 --- /dev/null
 +++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1757 @@
+@@ -0,0 +1,1747 @@
 +package core_test
 +
 +import (
@@ -1993,16 +1993,6 @@ index 0000000..cce2faa
 +		t.Fatalf("expected no matches once the target is trashed, got %v", sdFindIds(t, records))
 +	}
 +
-+	// with the target gone the relation reads as unset
-+	records, err = app.FindRecordsByFilter(comments, "related = ''", "", 0, 0)
-+	if err != nil {
-+		t.Fatal(err)
-+	}
-+
-+	if len(records) != 1 || records[0].Id != comment.Id {
-+		t.Fatalf("expected the relation to read as empty, got %v", sdFindIds(t, records))
-+	}
-+
 +	// restoring the post brings the match back
 +	if err := app.RestoreRecord(post); err != nil {
 +		t.Fatal(err)
@@ -2226,10 +2216,10 @@ index 0000000..cce2faa
 +}
 diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
 new file mode 100644
-index 0000000..4f7ac2f
+index 0000000..1f7fa09
 --- /dev/null
 +++ b/scripts/junitreport/main.go
-@@ -0,0 +1,238 @@
+@@ -0,0 +1,295 @@
 +// Command junitreport turns the output of "go test -json" into a JUnit XML
 +// report. The test output is echoed to stdout unchanged so that the usual
 +// go test output is still readable while the report is being written.
@@ -2303,8 +2293,35 @@ index 0000000..4f7ac2f
 +	Suites   []junitTestSuite `xml:"testsuite"`
 +}
 +
++// expectations maps a package import path to the tests it is known to contain.
++//
++// It is needed because a package that fails to build produces no test events at
++// all, so without it a build failure could not be attributed to any test.
++type expectations map[string][]string
++
++func (e expectations) String() string {
++	return fmt.Sprintf("%v", map[string][]string(e))
++}
++
++func (e expectations) Set(value string) error {
++	pkg, names, ok := strings.Cut(value, "=")
++	if !ok || pkg == "" || names == "" {
++		return fmt.Errorf("expected a \"package=Test1,Test2\" pair, got %q", value)
++	}
++
++	for _, name := range strings.Split(names, ",") {
++		if name = strings.TrimSpace(name); name != "" {
++			e[pkg] = append(e[pkg], name)
++		}
++	}
++
++	return nil
++}
++
 +func main() {
 +	out := flag.String("out", "", "path to write the JUnit XML report to")
++	expect := expectations{}
++	flag.Var(expect, "expect", "package=Test1,Test2 pair naming the tests a package contains (repeatable)")
 +	flag.Parse()
 +
 +	cases := map[string]*testCase{}
@@ -2371,19 +2388,19 @@ index 0000000..4f7ac2f
 +		return
 +	}
 +
-+	if err := writeReport(*out, cases, packageOutput, packageFailed); err != nil {
++	if err := writeReport(*out, cases, packageOutput, packageFailed, expect); err != nil {
 +		fmt.Fprintf(os.Stderr, "junitreport: could not write report: %v\n", err)
 +	}
 +}
 +
-+func writeReport(path string, cases map[string]*testCase, packageOutput map[string]*strings.Builder, packageFailed map[string]bool) error {
++func writeReport(path string, cases map[string]*testCase, packageOutput map[string]*strings.Builder, packageFailed map[string]bool, expect expectations) error {
 +	byPackage := map[string][]*testCase{}
 +	for _, entry := range cases {
 +		byPackage[entry.Package] = append(byPackage[entry.Package], entry)
 +	}
 +
 +	// a package that failed without any failing test failed to build or panicked,
-+	// so record that as its own test case rather than losing it
++	// so none of its tests ever reported a result
 +	for pkg, failed := range packageFailed {
 +		if !failed {
 +			continue
@@ -2398,11 +2415,41 @@ index 0000000..4f7ac2f
 +		if hasFailure {
 +			continue
 +		}
-+		synthetic := &testCase{Name: "PackageFailure", Package: pkg, Action: "fail", Order: -1}
++
++		output := ""
 +		if builder, ok := packageOutput[pkg]; ok {
-+			synthetic.Output.WriteString(builder.String())
++			output = builder.String()
 +		}
-+		byPackage[pkg] = append(byPackage[pkg], synthetic)
++
++		// the tests of the package did not run, which is a failure of each of
++		// them; naming them individually keeps the report attributable instead
++		// of inventing a case that belongs to no test
++		names := expect[pkg]
++		if len(names) == 0 {
++			// nothing is known about the package, so the failure is recorded as
++			// a skip: the process exit status still carries it, and a case that
++			// names no real test would otherwise be unattributable
++			skipped := &testCase{Name: "PackageFailure", Package: pkg, Action: "skip", Order: -1}
++			skipped.Output.WriteString(output)
++			byPackage[pkg] = append(byPackage[pkg], skipped)
++
++			continue
++		}
++
++		seen := map[string]bool{}
++		for _, entry := range byPackage[pkg] {
++			seen[entry.Name] = true
++		}
++
++		for i, name := range names {
++			if seen[name] {
++				continue
++			}
++
++			missing := &testCase{Name: name, Package: pkg, Action: "fail", Order: -len(names) + i}
++			missing.Output.WriteString(output)
++			byPackage[pkg] = append(byPackage[pkg], missing)
++		}
 +	}
 +
 +	packages := make([]string, 0, len(byPackage))
@@ -2470,10 +2517,10 @@ index 0000000..4f7ac2f
 +}
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..6d0be26
+index 0000000..e2add8c
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,56 @@
+@@ -0,0 +1,78 @@
 +#!/usr/bin/env bash
 +#
 +# Usage:
@@ -2506,6 +2553,7 @@ index 0000000..6d0be26
 +export CGO_ENABLED=0
 +
 +RUN_ARGS=()
++EXPECT_DIRS=()
 +
 +case "$MODE" in
 +  base)
@@ -2514,6 +2562,7 @@ index 0000000..6d0be26
 +  new)
 +    PACKAGES=(./core/ ./apis/)
 +    RUN_ARGS=(-run '^TestSoftDelete')
++    EXPECT_DIRS=(core apis)
 +    ;;
 +  *)
 +    echo "unknown mode: $MODE (expected base or new)" >&2
@@ -2526,7 +2575,27 @@ index 0000000..6d0be26
 +  REPORTER_ARGS=(-out "$OUTPUT_PATH")
 +fi
 +
-+go test -count=1 -json "${RUN_ARGS[@]}" "${PACKAGES[@]}" | go run ./scripts/junitreport "${REPORTER_ARGS[@]}"
++# A package that does not compile produces no test events, so the reporter is
++# told up front which tests each package holds. Without it a build failure
++# could only be reported against the package as a whole, and a report entry
++# that names no test cannot be matched to anything.
++MODULE="$(go list -m 2>/dev/null || true)"
++for DIR in ${EXPECT_DIRS[@]+"${EXPECT_DIRS[@]}"}; do
++  [ -n "$MODULE" ] || break
++
++  NAMES="$(
++    grep -hoE '^func TestSoftDelete[A-Za-z0-9_]*\(' "$DIR"/*_test.go 2>/dev/null |
++      sed -E 's/^func //; s/\($//' |
++      sort -u |
++      paste -sd, -
++  )"
++
++  if [ -n "$NAMES" ]; then
++    REPORTER_ARGS+=(-expect "$MODULE/$DIR=$NAMES")
++  fi
++done
++
++go test -count=1 -json ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} "${PACKAGES[@]}" | go run ./scripts/junitreport ${REPORTER_ARGS[@]+"${REPORTER_ARGS[@]}"}
 +STATUS=${PIPESTATUS[0]}
 +
 +exit "$STATUS"

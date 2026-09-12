@@ -27,6 +27,16 @@
   `TestRecordAuthWithOAuth2`, which already fails at the pinned commit because
   it needs outbound network.
 
+## Reporting a package that does not build
+
+Without the solution the `core` and `apis` packages do not compile, so `go test`
+emits no test events at all and the JUnit report cannot attribute the failure to
+any test. `test.sh` therefore hands the reporter the list of tests each package
+holds (grepped from the test sources), and the reporter marks exactly those as
+failed. The earlier synthetic `PackageFailure` entry is gone: it named no real
+test, so the verifier could not place it in either the regression or the new
+test set.
+
 ## Prior art (found by the Scope Gate)
 
 No soft delete, trash or deleted timestamp exists in the code at the pinned commit,
