@@ -19,7 +19,7 @@
 
 - **740 meaningful production LOC** added by the solution patch (blank lines,
   comments, imports, braces and test files excluded).
-- **100 graded test cases** in the `softdeletetests` package, with 3802 existing
+- **104 graded test cases** in the `softdeletetests` package, with 3802 existing
   `core`, `apis`, `forms`, `mails` and `tools` cases as the regression gate.
 - Verified in a clean checkout of the pinned commit:
   - test patch only -> `./test.sh base` **passes**, `./test.sh new` **fails**
@@ -45,6 +45,24 @@ than with the agents:
   now says it stays in the API record.
 - the two rules every run missed, the grouped restore dependency and relation
   filters in all their spellings, are stated more directly.
+
+## Measuring the rollout instead of guessing at it
+
+The ten agent solutions were replayed against the revised test patch in clean
+checkouts of the pinned commit, which turns the effect of each change into a
+number rather than an opinion:
+
+- the 401 fix removed the guest failure from every run
+- the multi-relation rewrite removed that failure from every run
+- the nonempty update rule and the three level cascade cost nothing: the three
+  closest runs stayed at the same failure count with three more cases
+- the batch restore scenario costs exactly one failure per run, so it is kept
+  only because the description now states it and the registration is three
+  lines
+
+What still fails on every replayed run is the grouped restore dependency and
+the relation filter spellings. Both are what the description now states
+directly, and no replay of the old agent code can show the effect of that.
 
 ## Reporting a package that does not build
 

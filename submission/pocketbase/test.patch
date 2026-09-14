@@ -329,10 +329,10 @@ index 0000000..5623cef
 +}
 diff --git a/softdeletetests/api_soft_delete_280aff_test.go b/softdeletetests/api_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..6131168
+index 0000000..8537ba5
 --- /dev/null
 +++ b/softdeletetests/api_soft_delete_280aff_test.go
-@@ -0,0 +1,457 @@
+@@ -0,0 +1,538 @@
 +package softdeletetests
 +
 +import (
@@ -624,6 +624,87 @@ index 0000000..6131168
 +			},
 +		},
 +		{
++			Name:   "the restore action works through the batch endpoint",
++			Method: http.MethodPost,
++			URL:    "/api/batch",
++			Body: strings.NewReader(`{
++				"requests": [
++					{"method":"POST", "url":"/api/collections/sd_api_posts/records/` + sdTrashedRecordId + `/restore"}
++				]
++			}`),
++			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
++				sdApiSetup(t, app)
++				app.Settings().Batch.Enabled = true
++			},
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdTrashedRecordId + `"`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindRecordById("sd_api_posts", sdTrashedRecordId); err != nil {
++					t.Fatalf("expected the batched restore to bring the record back, got %v", err)
++				}
++			},
++		},
++		{
++			Name:   "a nonempty update rule that does not match refuses the restore",
++			Method: http.MethodPost,
++			URL:    "/api/collections/sd_api_posts/records/" + sdTrashedRecordId + "/restore",
++			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
++				sdApiSetup(t, app)
++
++				collection, err := app.FindCollectionByNameOrId("sd_api_posts")
++				if err != nil {
++					t.Fatal(err)
++				}
++
++				// the trashed record is titled "trashed one", so the rule below
++				// keeps it out and the restore has to respect that
++				rule := "title = 'allowed'"
++				collection.UpdateRule = &rule
++				if err := app.Save(collection); err != nil {
++					t.Fatal(err)
++				}
++			},
++			ExpectedStatus: 404,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindRecordById("sd_api_posts", sdTrashedRecordId); err == nil {
++					t.Fatal("expected the record to stay in the trash")
++				}
++			},
++		},
++		{
++			Name:   "a nonempty update rule that matches allows the restore",
++			Method: http.MethodPost,
++			URL:    "/api/collections/sd_api_posts/records/" + sdTrashedRecordId + "/restore",
++			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
++				sdApiSetup(t, app)
++
++				collection, err := app.FindCollectionByNameOrId("sd_api_posts")
++				if err != nil {
++					t.Fatal(err)
++				}
++
++				rule := "title = 'trashed one'"
++				collection.UpdateRule = &rule
++				if err := app.Save(collection); err != nil {
++					t.Fatal(err)
++				}
++			},
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdTrashedRecordId + `"`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindRecordById("sd_api_posts", sdTrashedRecordId); err != nil {
++					t.Fatalf("expected the record to be restored, got %v", err)
++				}
++			},
++		},
++		{
 +			Name:   "restoring is guarded by the collection update rule",
 +			Method: http.MethodPost,
 +			URL:    "/api/collections/sd_api_posts/records/" + sdTrashedRecordId + "/restore",
@@ -792,10 +873,10 @@ index 0000000..6131168
 +}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..44fd3bd
+index 0000000..531ba06
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,1734 @@
+@@ -0,0 +1,1776 @@
 +package softdeletetests
 +
 +import (
@@ -2528,6 +2609,48 @@ index 0000000..44fd3bd
 +
 +	if err := app.RestoreRecord(trashedChild); err != nil {
 +		t.Fatalf("expected the child to be restorable once its dependency is live, got %v", err)
++	}
++}
++
++func TestSoftDeletePurgeCascadesThroughEveryLevel(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	root, middle, child := sdDependencyChain(t, app)
++
++	rootRecord := sdNewRecord(t, app, root, map[string]any{"title": "root"})
++	middleRecord := sdNewRecord(t, app, middle, map[string]any{"root": rootRecord.Id})
++	liveLeaf := sdNewRecord(t, app, child, map[string]any{
++		"root":   rootRecord.Id,
++		"middle": middleRecord.Id,
++	})
++	trashedLeaf := sdNewRecord(t, app, child, map[string]any{
++		"root":   rootRecord.Id,
++		"middle": middleRecord.Id,
++	})
++
++	// one leaf is already in the trash before the permanent delete reaches it
++	if err := app.Delete(trashedLeaf); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.PurgeRecord(rootRecord); err != nil {
++		t.Fatal(err)
++	}
++
++	for _, pair := range []struct {
++		collection *core.Collection
++		id         string
++		label      string
++	}{
++		{root, rootRecord.Id, "root"},
++		{middle, middleRecord.Id, "middle"},
++		{child, liveLeaf.Id, "live leaf"},
++		{child, trashedLeaf.Id, "already trashed leaf"},
++	} {
++		if sdRawExists(t, app, pair.collection, pair.id) {
++			t.Fatalf("expected the %s row to be gone, it is still there", pair.label)
++		}
 +	}
 +}
 diff --git a/test.sh b/test.sh
