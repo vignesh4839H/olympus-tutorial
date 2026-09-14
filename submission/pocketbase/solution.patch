@@ -73,7 +73,7 @@ index d6d8b58..809f592 100644
  	collection := record.Collection()
  	if collection == nil {
 diff --git a/apis/record_crud.go b/apis/record_crud.go
-index 3a35e93..090c8a0 100644
+index 3a35e93..8f3ccb5 100644
 --- a/apis/record_crud.go
 +++ b/apis/record_crud.go
 @@ -6,6 +6,7 @@ import (
@@ -92,13 +92,13 @@ index 3a35e93..090c8a0 100644
  )
  
  // bindRecordCrudApi registers the record crud api endpoints and
-@@ -31,6 +33,119 @@ func bindRecordCrudApi(app core.App, rg *router.RouterGroup[*core.RequestEvent])
+@@ -31,6 +33,110 @@ func bindRecordCrudApi(app core.App, rg *router.RouterGroup[*core.RequestEvent])
  	subGroup.POST("", recordCreate(true, nil)).Bind(dynamicCollectionBodyLimit(""))
  	subGroup.PATCH("/{id}", recordUpdate(true, nil)).Bind(dynamicCollectionBodyLimit(""))
  	subGroup.DELETE("/{id}", recordDelete(true, nil))
 +	subGroup.POST("/{id}/restore", recordRestore(true, nil))
 +
-+	rg.DELETE("/collections/{collection}/trash", recordsPurgeTrash)
++	rg.DELETE("/collections/{collection}/trash", recordsPurgeTrash).Bind(RequireSuperuserAuth())
 +}
 +
 +// recordsPurgeTrash permanently deletes the trashed records of the collection.
@@ -116,15 +116,6 @@ index 3a35e93..090c8a0 100644
 +
 +	if !collection.IsSoftDeleteEnabled() {
 +		return e.BadRequestError("The collection doesn't have the soft delete mode enabled.", nil)
-+	}
-+
-+	requestInfo, err := e.RequestInfo()
-+	if err != nil {
-+		return firstApiError(err, e.BadRequestError("", err))
-+	}
-+
-+	if !requestInfo.HasSuperuserAuth() {
-+		return e.ForbiddenError("Only superusers can perform this action.", nil)
 +	}
 +
 +	// the zero value purges the entire trash
@@ -212,7 +203,7 @@ index 3a35e93..090c8a0 100644
  }
  
  func recordsList(e *core.RequestEvent) error {
-@@ -59,7 +174,20 @@ func recordsList(e *core.RequestEvent) error {
+@@ -59,7 +165,20 @@ func recordsList(e *core.RequestEvent) error {
  		return err
  	}
  
@@ -234,7 +225,7 @@ index 3a35e93..090c8a0 100644
  
  	fieldsResolver := core.NewRecordFieldResolver(e.App, collection, requestInfo, true)
  
-@@ -185,7 +313,12 @@ func recordView(e *core.RequestEvent) error {
+@@ -185,7 +304,12 @@ func recordView(e *core.RequestEvent) error {
  		return nil
  	}
  
@@ -248,7 +239,7 @@ index 3a35e93..090c8a0 100644
  	if fetchErr != nil || record == nil {
  		return firstApiError(err, e.NotFoundError("", fetchErr))
  	}
-@@ -577,7 +710,18 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
+@@ -577,7 +701,18 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
  			return nil
  		}
  
@@ -268,7 +259,7 @@ index 3a35e93..090c8a0 100644
  		if err != nil || record == nil {
  			return e.NotFoundError("", err)
  		}
-@@ -590,8 +734,14 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
+@@ -590,8 +725,14 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
  		event.Record = record
  
  		hookErr := e.App.OnRecordDeleteRequest().Trigger(event, func(e *core.RecordRequestEvent) error {
@@ -285,7 +276,7 @@ index 3a35e93..090c8a0 100644
  			}
  
  			err = execAfterSuccessTx(responseWriteAfterTx, e.App, func() error {
-@@ -626,6 +776,111 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
+@@ -626,6 +767,111 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
  	}
  }
  
@@ -967,10 +958,10 @@ index 425cc5e..c44c206 100644
  	// replace existing
  	for i, j := range r.listRuleJoins {
 diff --git a/core/record_field_resolver_runner.go b/core/record_field_resolver_runner.go
-index fa65893..1c5eaf7 100644
+index fa65893..3026cd0 100644
 --- a/core/record_field_resolver_runner.go
 +++ b/core/record_field_resolver_runner.go
-@@ -650,87 +650,135 @@ func (r *runner) processActiveProps() (*search.ResolverResult, error) {
+@@ -650,87 +650,104 @@ func (r *runner) processActiveProps() (*search.ResolverResult, error) {
  
  		// "id" lookups optimization for single relations to avoid unnecessary joins,
  		// aka. "user.id" and "user" should produce the same query identifier
@@ -1137,68 +1128,32 @@ index fa65893..1c5eaf7 100644
 +	// ---
 +
 +	return nil
-+}
-+
-+// resolveLiveRelationLength resolves the ":length" modifier of a relation
-+// pointing to a soft delete enabled collection.
-+//
-+// The stored json array keeps the ids of the trashed targets, so instead of
-+// its raw length the modifier reports how many of them are still visible.
-+func (r *runner) resolveLiveRelationLength(relField *RelationField, relCollection *Collection) (*search.ResolverResult, error) {
-+	cleanFieldName := inflector.Columnify(relField.Name)
-+
-+	// the aliases below live in their own subquery scope,
-+	// so they cannot collide with the ones of the outer query
-+	liveCount := func(tableAlias string) string {
-+		return fmt.Sprintf(
-+			"(SELECT COUNT(*) FROM {{%s}} {{__lr}} WHERE [[__lr.%s]] = '' AND [[__lr.id]] IN (SELECT [[__lje.value]] FROM %s {{__lje}}))",
-+			inflector.Columnify(relCollection.Name),
-+			FieldNameDeleted,
-+			dbutils.JSONEach(tableAlias+"."+cleanFieldName),
-+		)
-+	}
-+
-+	result := &search.ResolverResult{
-+		Identifier: liveCount(r.activeTableAlias),
-+	}
-+
-+	if r.withMultiMatch {
-+		r.multiMatch.ValueIdentifier = liveCount(r.multiMatchActiveTableAlias)
-+		result.MultiMatchSubQuery = r.multiMatch
-+	}
-+
-+	return result, nil
  }
  
  func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop string, propDepth int) (*search.ResolverResult, error) {
-@@ -751,6 +799,39 @@ func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop stri
+@@ -751,6 +768,34 @@ func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop stri
  		return nil, fmt.Errorf("non-filterable field %q", name)
  	}
  
-+	// relations to a soft delete enabled collection
++	// single relations to a soft delete enabled collection
 +	// -------------------------------------------------------
-+	// the stored foreign key still holds the ids of the trashed targets,
-+	// so comparing it directly would leak them; the value is resolved from
-+	// the related table instead, making "rel" and "rel.id" equivalent again
-+	if relField, ok := field.(*RelationField); ok {
++	// every other relation form already reaches the related table through a
++	// join, which carries the exclusion. A single relation is the exception:
++	// it is compared against the stored foreign key, which still holds the id
++	// of a trashed target, so it is resolved from the related table instead
++	// and "rel" means the same as "rel.id" again
++	if relField, ok := field.(*RelationField); ok && !relField.IsMultiple() && modifier != lengthModifier {
 +		relCollection, err := r.resolver.loadCollection(relField.CollectionId)
 +		if err != nil {
 +			return nil, fmt.Errorf("failed to load field %q collection", name)
 +		}
 +
 +		if relCollection.IsSoftDeleteEnabled() {
-+			// ":length" has no related row to compare against, so it is
-+			// rewritten into a count of the still visible targets
-+			if modifier == lengthModifier {
-+				return r.resolveLiveRelationLength(relField, relCollection)
-+			}
-+
 +			err = r.joinRelation(relField, relCollection)
 +			if err != nil {
 +				return nil, err
 +			}
 +
-+			// the ":each" expansion is already covered by the join
 +			idProp := FieldNameId
 +			if modifier == lowerModifier {
 +				idProp += ":" + lowerModifier
@@ -1577,10 +1532,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..744f0df
+index 0000000..7536a12
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,668 @@
+@@ -0,0 +1,734 @@
 +package core
 +
 +import (
@@ -1797,16 +1752,55 @@ index 0000000..744f0df
 +
 +	// reflect the new state in the in-memory model so that the after-delete
 +	// hooks (and the caller) can tell a trashed record from a removed one
++	previous := e.Record.GetRaw(FieldNameDeleted)
++	previousOriginal := e.Record.originalData[FieldNameDeleted]
++
 +	e.Record.SetRaw(FieldNameDeleted, trashedAt)
 +	e.Record.originalData[FieldNameDeleted] = trashedAt
 +	e.Record.trashTransition = true
 +
++	// the row is only trashed once the enclosing transaction commits, so a
++	// rollback has to take the model back with it; otherwise the caller is
++	// left holding a record that looks trashed while its row is live and a
++	// retried delete would remove it for good
++	revertTrashTransitionOnRollback(e.App, e.Record, previous, previousOriginal)
++
 +	return nil
++}
++
++// revertTrashTransitionOnRollback puts the in-memory trash state of the record
++// back if the transaction it was written in does not commit.
++//
++// Outside of a transaction there is nothing to wait for and the state stands.
++func revertTrashTransitionOnRollback(app App, record *Record, previous any, previousOriginal any) {
++	txInfo := app.TxInfo()
++	if txInfo == nil {
++		return
++	}
++
++	txInfo.OnComplete(func(txErr error) error {
++		if txErr == nil {
++			return nil
++		}
++
++		record.SetRaw(FieldNameDeleted, previous)
++		record.originalData[FieldNameDeleted] = previousOriginal
++		record.trashTransition = false
++
++		return nil
++	})
 +}
 +
 +// trashCascadeBatchSize is the number of referencing record ids loaded at once
 +// by the trash and restore cascades.
 +const trashCascadeBatchSize = 500
++
++// maxTrashRetention is the longest retention the cutoff arithmetic can express,
++// which is far longer than any real retention period.
++const (
++	maxTrashRetention        = time.Duration(1<<63 - 1)
++	maxTrashRetentionSeconds = maxTrashRetention / time.Second
++)
 +
 +// eachReferencingRecordId walks the ids of the records referencing the main
 +// record and invokes the callback for each of them.
@@ -2160,6 +2154,24 @@ index 0000000..744f0df
 +		member.originalData[FieldNameDeleted] = types.DateTime{}
 +	}
 +
++	// ... but only once the enclosing transaction commits. A rollback leaves
++	// the rows trashed, and a caller holding records that look live would find
++	// a retried restore doing nothing at the untrashed check
++	if txInfo := app.TxInfo(); txInfo != nil {
++		txInfo.OnComplete(func(txErr error) error {
++			if txErr == nil {
++				return nil
++			}
++
++			for _, member := range group {
++				member.SetRaw(FieldNameDeleted, trashedAt)
++				member.originalData[FieldNameDeleted] = trashedAt
++			}
++
++			return nil
++		})
++	}
++
 +	return nil
 +}
 +
@@ -2239,7 +2251,16 @@ index 0000000..744f0df
 +			continue
 +		}
 +
-+		before := types.NowDateTime().Add(-1 * time.Duration(collection.TrashRetention) * time.Second)
++		// the retention is an unbounded number of seconds, so it is clamped
++		// before it reaches the duration arithmetic: left alone, a large enough
++		// value wraps and yields a cutoff in the future, which would purge the
++		// very records it is meant to keep
++		retention := time.Duration(collection.TrashRetention) * time.Second
++		if collection.TrashRetention > int(maxTrashRetentionSeconds) {
++			retention = maxTrashRetention
++		}
++
++		before := types.NowDateTime().Add(-1 * retention)
 +
 +		_, purgeErr := app.PurgeTrashedRecords(collection, before)
 +		if purgeErr != nil {

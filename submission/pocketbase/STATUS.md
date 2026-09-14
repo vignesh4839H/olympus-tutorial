@@ -17,15 +17,34 @@
 
 ## Measured results
 
-- **738 meaningful production LOC** added by the solution patch (blank lines,
+- **740 meaningful production LOC** added by the solution patch (blank lines,
   comments, imports, braces and test files excluded).
-- **100 graded test cases** across `core` and `apis`.
+- **100 graded test cases** in the `softdeletetests` package, with 3802 existing
+  `core`, `apis`, `forms`, `mails` and `tools` cases as the regression gate.
 - Verified in a clean checkout of the pinned commit:
   - test patch only -> `./test.sh base` **passes**, `./test.sh new` **fails**
   - test + solution -> `./test.sh base` **passes**, `./test.sh new` **passes**
 - Full `go test ./...` after the solution: everything green except
   `TestRecordAuthWithOAuth2`, which already fails at the pinned commit because
   it needs outbound network.
+
+## Rollout findings
+
+The first rollout run solved 0 of 10, which fails the solvability gate. The
+agent runs and the auto review agreed on what was wrong with the task rather
+than with the agents:
+
+- the guest trash purge expected 403 while the repository's own
+  `RequireSuperuserAuth` returns 401, which nine runs hit. The endpoint now
+  uses that middleware and the test expects 401.
+- the multi-relation filter test asserted that `targets ?= 'id'` matches before
+  anything is trashed, which stock PocketBase never does. That was an unrelated
+  change to bare multi-relation filtering, now reverted; the resolver only
+  reroutes single relations, which is the one form that compares a stored key.
+- six runs treated the generated `deleted` field as hidden, so the description
+  now says it stays in the API record.
+- the two rules every run missed, the grouped restore dependency and relation
+  filters in all their spellings, are stated more directly.
 
 ## Reporting a package that does not build
 

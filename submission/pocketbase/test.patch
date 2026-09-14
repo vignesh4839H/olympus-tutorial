@@ -1,10 +1,339 @@
-diff --git a/apis/record_soft_delete_280aff_test.go b/apis/record_soft_delete_280aff_test.go
+diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
 new file mode 100644
-index 0000000..fd816cc
+index 0000000..5623cef
 --- /dev/null
-+++ b/apis/record_soft_delete_280aff_test.go
++++ b/scripts/junitreport/main.go
+@@ -0,0 +1,323 @@
++// Command junitreport turns the output of "go test -json" into a JUnit XML
++// report. The test output is echoed to stdout unchanged so that the usual
++// go test output is still readable while the report is being written.
++package main
++
++import (
++	"bufio"
++	"encoding/json"
++	"encoding/xml"
++	"flag"
++	"fmt"
++	"os"
++	"sort"
++	"strings"
++)
++
++type testEvent struct {
++	Action  string  `json:"Action"`
++	Package string  `json:"Package"`
++	Test    string  `json:"Test"`
++	Elapsed float64 `json:"Elapsed"`
++	Output  string  `json:"Output"`
++
++	// the build events of a package that does not compile carry the import
++	// path instead of the package, and they hold the compiler diagnostic
++	ImportPath string `json:"ImportPath"`
++}
++
++type testCase struct {
++	Name    string
++	Package string
++	Action  string
++	Elapsed float64
++	Output  strings.Builder
++	Order   int
++}
++
++type junitFailure struct {
++	XMLName xml.Name `xml:"failure"`
++	Message string   `xml:"message,attr"`
++	Type    string   `xml:"type,attr,omitempty"`
++	Body    string   `xml:",chardata"`
++}
++
++type junitSkipped struct {
++	XMLName xml.Name `xml:"skipped"`
++	Message string   `xml:"message,attr"`
++}
++
++type junitTestCase struct {
++	XMLName   xml.Name      `xml:"testcase"`
++	Name      string        `xml:"name,attr"`
++	ClassName string        `xml:"classname,attr"`
++	Time      string        `xml:"time,attr"`
++	Failure   *junitFailure `xml:"failure,omitempty"`
++	Skipped   *junitSkipped `xml:"skipped,omitempty"`
++	SystemOut string        `xml:"system-out,omitempty"`
++}
++
++type junitTestSuite struct {
++	XMLName   xml.Name        `xml:"testsuite"`
++	Name      string          `xml:"name,attr"`
++	Tests     int             `xml:"tests,attr"`
++	Failures  int             `xml:"failures,attr"`
++	Skipped   int             `xml:"skipped,attr"`
++	Errors    int             `xml:"errors,attr"`
++	Time      string          `xml:"time,attr"`
++	TestCases []junitTestCase `xml:"testcase"`
++}
++
++type junitTestSuites struct {
++	XMLName  xml.Name         `xml:"testsuites"`
++	Tests    int              `xml:"tests,attr"`
++	Failures int              `xml:"failures,attr"`
++	Suites   []junitTestSuite `xml:"testsuite"`
++}
++
++// expectations maps a package import path to the tests it is known to contain.
++//
++// It is needed because a package that fails to build produces no test events at
++// all, so without it a build failure could not be attributed to any test.
++type expectations map[string][]string
++
++func (e expectations) String() string {
++	return fmt.Sprintf("%v", map[string][]string(e))
++}
++
++func (e expectations) Set(value string) error {
++	pkg, names, ok := strings.Cut(value, "=")
++	if !ok || pkg == "" || names == "" {
++		return fmt.Errorf("expected a \"package=Test1,Test2\" pair, got %q", value)
++	}
++
++	for _, name := range strings.Split(names, ",") {
++		if name = strings.TrimSpace(name); name != "" {
++			e[pkg] = append(e[pkg], name)
++		}
++	}
++
++	return nil
++}
++
++func main() {
++	out := flag.String("out", "", "path to write the JUnit XML report to")
++	expect := expectations{}
++	flag.Var(expect, "expect", "package=Test1,Test2 pair naming the tests a package contains (repeatable)")
++	flag.Parse()
++
++	cases := map[string]*testCase{}
++	packageOutput := map[string]*strings.Builder{}
++	packageFailed := map[string]bool{}
++	order := 0
++
++	stdout := bufio.NewWriter(os.Stdout)
++	defer stdout.Flush()
++
++	scanner := bufio.NewScanner(os.Stdin)
++	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
++
++	for scanner.Scan() {
++		line := scanner.Bytes()
++
++		var event testEvent
++		if err := json.Unmarshal(line, &event); err != nil {
++			// not a json line, pass it through so nothing is hidden
++			fmt.Fprintln(stdout, string(line))
++			continue
++		}
++
++		if event.Output != "" {
++			fmt.Fprint(stdout, event.Output)
++		}
++
++		if event.Package == "" {
++			event.Package = event.ImportPath
++		}
++
++		// the build events of a test binary carry the "pkg [pkg.test]" form,
++		// which has to fold into the package it belongs to
++		event.Package = normalizePackage(event.Package)
++
++		if event.Action == "build-fail" {
++			packageFailed[event.Package] = true
++		}
++
++		if event.Test == "" {
++			if _, seen := packageOutput[event.Package]; !seen {
++				packageOutput[event.Package] = &strings.Builder{}
++			}
++			if event.Output != "" {
++				packageOutput[event.Package].WriteString(event.Output)
++			}
++			if event.Action == "fail" {
++				packageFailed[event.Package] = true
++			}
++			continue
++		}
++
++		key := event.Package + "\x00" + event.Test
++		entry, seen := cases[key]
++		if !seen {
++			entry = &testCase{Name: event.Test, Package: event.Package, Order: order}
++			order++
++			cases[key] = entry
++		}
++
++		if event.Output != "" {
++			entry.Output.WriteString(event.Output)
++		}
++		switch event.Action {
++		case "pass", "fail", "skip":
++			entry.Action = event.Action
++			entry.Elapsed = event.Elapsed
++		}
++	}
++
++	if err := scanner.Err(); err != nil {
++		fmt.Fprintf(os.Stderr, "junitreport: could not read test output: %v\n", err)
++	}
++
++	if *out == "" {
++		return
++	}
++
++	if err := writeReport(*out, cases, packageOutput, packageFailed, expect); err != nil {
++		fmt.Fprintf(os.Stderr, "junitreport: could not write report: %v\n", err)
++		stdout.Flush()
++		os.Exit(1)
++	}
++}
++
++func writeReport(path string, cases map[string]*testCase, packageOutput map[string]*strings.Builder, packageFailed map[string]bool, expect expectations) error {
++	byPackage := map[string][]*testCase{}
++	for _, entry := range cases {
++		byPackage[entry.Package] = append(byPackage[entry.Package], entry)
++	}
++
++	// a package that failed without any failing test failed to build or panicked,
++	// so none of its tests ever reported a result
++	for pkg, failed := range packageFailed {
++		if !failed {
++			continue
++		}
++		hasFailure := false
++		for _, entry := range byPackage[pkg] {
++			if entry.Action == "fail" {
++				hasFailure = true
++				break
++			}
++		}
++		if hasFailure {
++			continue
++		}
++
++		output := ""
++		if builder, ok := packageOutput[pkg]; ok {
++			output = builder.String()
++		}
++
++		// the tests of the package did not run, which is a failure of each of
++		// them; naming them individually keeps the report attributable instead
++		// of inventing a case that belongs to no test
++		names := expect[pkg]
++		if len(names) == 0 {
++			// nothing is known about the package, so the failure cannot be
++			// attributed to a test; it is still reported as a failure, with the
++			// build or panic output, rather than hidden behind a skip
++			synthetic := &testCase{Name: "PackageFailure", Package: pkg, Action: "fail", Order: -1}
++			synthetic.Output.WriteString(output)
++			byPackage[pkg] = append(byPackage[pkg], synthetic)
++
++			continue
++		}
++
++		seen := map[string]bool{}
++		for _, entry := range byPackage[pkg] {
++			seen[entry.Name] = true
++		}
++
++		for i, name := range names {
++			if seen[name] {
++				continue
++			}
++
++			missing := &testCase{Name: name, Package: pkg, Action: "fail", Order: -len(names) + i}
++			missing.Output.WriteString(output)
++			byPackage[pkg] = append(byPackage[pkg], missing)
++		}
++	}
++
++	packages := make([]string, 0, len(byPackage))
++	for pkg := range byPackage {
++		packages = append(packages, pkg)
++	}
++	sort.Strings(packages)
++
++	report := junitTestSuites{}
++	for _, pkg := range packages {
++		entries := byPackage[pkg]
++		sort.Slice(entries, func(i, j int) bool { return entries[i].Order < entries[j].Order })
++
++		suite := junitTestSuite{Name: pkg}
++		total := 0.0
++		for _, entry := range entries {
++			total += entry.Elapsed
++			testcase := junitTestCase{
++				Name:      entry.Name,
++				ClassName: pkg,
++				Time:      fmt.Sprintf("%.3f", entry.Elapsed),
++			}
++			switch entry.Action {
++			case "fail":
++				testcase.Failure = &junitFailure{
++					Message: "Failed",
++					Type:    "go.test.failure",
++					Body:    scrub(entry.Output.String()),
++				}
++				suite.Failures++
++			case "skip":
++				testcase.Skipped = &junitSkipped{Message: "Skipped"}
++				suite.Skipped++
++			default:
++				testcase.SystemOut = scrub(entry.Output.String())
++			}
++			suite.TestCases = append(suite.TestCases, testcase)
++			suite.Tests++
++		}
++		suite.Time = fmt.Sprintf("%.3f", total)
++		report.Tests += suite.Tests
++		report.Failures += suite.Failures
++		report.Suites = append(report.Suites, suite)
++	}
++
++	encoded, err := xml.MarshalIndent(report, "", "  ")
++	if err != nil {
++		return err
++	}
++
++	return os.WriteFile(path, append([]byte(xml.Header), append(encoded, '\n')...), 0644)
++}
++
++// normalizePackage strips the test binary suffix that go test adds to the
++// import path of the build events, so that they land on the package itself.
++func normalizePackage(pkg string) string {
++	if i := strings.Index(pkg, " ["); i >= 0 {
++		return pkg[:i]
++	}
++
++	return pkg
++}
++
++// scrub drops the control characters that are not legal in XML character data.
++func scrub(value string) string {
++	return strings.Map(func(r rune) rune {
++		if r == '\t' || r == '\n' || r == '\r' {
++			return r
++		}
++		if r < 0x20 {
++			return -1
++		}
++		return r
++	}, value)
++}
+diff --git a/softdeletetests/api_soft_delete_280aff_test.go b/softdeletetests/api_soft_delete_280aff_test.go
+new file mode 100644
+index 0000000..6131168
+--- /dev/null
++++ b/softdeletetests/api_soft_delete_280aff_test.go
 @@ -0,0 +1,457 @@
-+package apis_test
++package softdeletetests
 +
 +import (
 +	"net/http"
@@ -346,7 +675,7 @@ index 0000000..fd816cc
 +			Method:         http.MethodDelete,
 +			URL:            "/api/collections/sd_api_posts/trash",
 +			BeforeTestFunc: sdBefore,
-+			ExpectedStatus: 403,
++			ExpectedStatus: 401,
 +			ExpectedContent: []string{
 +				`"data":`,
 +			},
@@ -461,13 +790,13 @@ index 0000000..fd816cc
 +		scenario.Test(t)
 +	}
 +}
-diff --git a/core/record_soft_delete_280aff_test.go b/core/record_soft_delete_280aff_test.go
+diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..f98ea7f
+index 0000000..44fd3bd
 --- /dev/null
-+++ b/core/record_soft_delete_280aff_test.go
-@@ -0,0 +1,1747 @@
-+package core_test
++++ b/softdeletetests/core_soft_delete_280aff_test.go
+@@ -0,0 +1,1734 @@
++package softdeletetests
 +
 +import (
 +	"database/sql"
@@ -2047,34 +2376,21 @@ index 0000000..f98ea7f
 +		}
 +	}
 +
-+	assertMatches("bare before", "targets ?= '"+first.Id+"'", 1)
-+	assertMatches("each before", "targets:each ?= '"+first.Id+"'", 1)
-+	assertMatches("length before", "targets:length = 2", 1)
++	assertMatches("id before", "targets.id ?= '"+first.Id+"'", 1)
++	assertMatches("title before", "targets.title ?= 'first'", 1)
 +
 +	if err := app.Delete(first); err != nil {
 +		t.Fatal(err)
 +	}
 +
-+	assertMatches("bare after", "targets ?= '"+first.Id+"'", 0)
-+	assertMatches("each after", "targets:each ?= '"+first.Id+"'", 0)
-+
-+	// the trashed target must not be counted anymore
-+	assertMatches("stale length after", "targets:length = 2", 0)
-+	assertMatches("length after", "targets:length = 1", 1)
++	assertMatches("id after", "targets.id ?= '"+first.Id+"'", 0)
++	assertMatches("title after", "targets.title ?= 'first'", 0)
 +
 +	// the still live target keeps matching
-+	assertMatches("live sibling", "targets ?= '"+second.Id+"'", 1)
++	assertMatches("live sibling", "targets.id ?= '"+second.Id+"'", 1)
++	assertMatches("live sibling title", "targets.title ?= 'second'", 1)
 +}
 +
-+// sdDependencyChain builds three soft delete collections where a single delete
-+// produces a group whose members cascade-depend on each other:
-+//
-+//	sd_dep_child -> sd_dep_middle -> sd_dep_root
-+//	sd_dep_child -> sd_dep_root
-+//
-+// Collection name order reaches the child before the middle record, so a
-+// restore that walks the group in that order sees a dependency that is still
-+// in the trash.
 +func sdDependencyChain(t testing.TB, app core.App) (*core.Collection, *core.Collection, *core.Collection) {
 +	t.Helper()
 +
@@ -2214,313 +2530,12 @@ index 0000000..f98ea7f
 +		t.Fatalf("expected the child to be restorable once its dependency is live, got %v", err)
 +	}
 +}
-diff --git a/scripts/junitreport/main.go b/scripts/junitreport/main.go
-new file mode 100644
-index 0000000..1f7fa09
---- /dev/null
-+++ b/scripts/junitreport/main.go
-@@ -0,0 +1,295 @@
-+// Command junitreport turns the output of "go test -json" into a JUnit XML
-+// report. The test output is echoed to stdout unchanged so that the usual
-+// go test output is still readable while the report is being written.
-+package main
-+
-+import (
-+	"bufio"
-+	"encoding/json"
-+	"encoding/xml"
-+	"flag"
-+	"fmt"
-+	"os"
-+	"sort"
-+	"strings"
-+)
-+
-+type testEvent struct {
-+	Action  string  `json:"Action"`
-+	Package string  `json:"Package"`
-+	Test    string  `json:"Test"`
-+	Elapsed float64 `json:"Elapsed"`
-+	Output  string  `json:"Output"`
-+}
-+
-+type testCase struct {
-+	Name    string
-+	Package string
-+	Action  string
-+	Elapsed float64
-+	Output  strings.Builder
-+	Order   int
-+}
-+
-+type junitFailure struct {
-+	XMLName xml.Name `xml:"failure"`
-+	Message string   `xml:"message,attr"`
-+	Type    string   `xml:"type,attr,omitempty"`
-+	Body    string   `xml:",chardata"`
-+}
-+
-+type junitSkipped struct {
-+	XMLName xml.Name `xml:"skipped"`
-+	Message string   `xml:"message,attr"`
-+}
-+
-+type junitTestCase struct {
-+	XMLName   xml.Name      `xml:"testcase"`
-+	Name      string        `xml:"name,attr"`
-+	ClassName string        `xml:"classname,attr"`
-+	Time      string        `xml:"time,attr"`
-+	Failure   *junitFailure `xml:"failure,omitempty"`
-+	Skipped   *junitSkipped `xml:"skipped,omitempty"`
-+	SystemOut string        `xml:"system-out,omitempty"`
-+}
-+
-+type junitTestSuite struct {
-+	XMLName   xml.Name        `xml:"testsuite"`
-+	Name      string          `xml:"name,attr"`
-+	Tests     int             `xml:"tests,attr"`
-+	Failures  int             `xml:"failures,attr"`
-+	Skipped   int             `xml:"skipped,attr"`
-+	Errors    int             `xml:"errors,attr"`
-+	Time      string          `xml:"time,attr"`
-+	TestCases []junitTestCase `xml:"testcase"`
-+}
-+
-+type junitTestSuites struct {
-+	XMLName  xml.Name         `xml:"testsuites"`
-+	Tests    int              `xml:"tests,attr"`
-+	Failures int              `xml:"failures,attr"`
-+	Suites   []junitTestSuite `xml:"testsuite"`
-+}
-+
-+// expectations maps a package import path to the tests it is known to contain.
-+//
-+// It is needed because a package that fails to build produces no test events at
-+// all, so without it a build failure could not be attributed to any test.
-+type expectations map[string][]string
-+
-+func (e expectations) String() string {
-+	return fmt.Sprintf("%v", map[string][]string(e))
-+}
-+
-+func (e expectations) Set(value string) error {
-+	pkg, names, ok := strings.Cut(value, "=")
-+	if !ok || pkg == "" || names == "" {
-+		return fmt.Errorf("expected a \"package=Test1,Test2\" pair, got %q", value)
-+	}
-+
-+	for _, name := range strings.Split(names, ",") {
-+		if name = strings.TrimSpace(name); name != "" {
-+			e[pkg] = append(e[pkg], name)
-+		}
-+	}
-+
-+	return nil
-+}
-+
-+func main() {
-+	out := flag.String("out", "", "path to write the JUnit XML report to")
-+	expect := expectations{}
-+	flag.Var(expect, "expect", "package=Test1,Test2 pair naming the tests a package contains (repeatable)")
-+	flag.Parse()
-+
-+	cases := map[string]*testCase{}
-+	packageOutput := map[string]*strings.Builder{}
-+	packageFailed := map[string]bool{}
-+	order := 0
-+
-+	stdout := bufio.NewWriter(os.Stdout)
-+	defer stdout.Flush()
-+
-+	scanner := bufio.NewScanner(os.Stdin)
-+	scanner.Buffer(make([]byte, 0, 1024*1024), 16*1024*1024)
-+
-+	for scanner.Scan() {
-+		line := scanner.Bytes()
-+
-+		var event testEvent
-+		if err := json.Unmarshal(line, &event); err != nil {
-+			// not a json line, pass it through so nothing is hidden
-+			fmt.Fprintln(stdout, string(line))
-+			continue
-+		}
-+
-+		if event.Output != "" {
-+			fmt.Fprint(stdout, event.Output)
-+		}
-+
-+		if event.Test == "" {
-+			if _, seen := packageOutput[event.Package]; !seen {
-+				packageOutput[event.Package] = &strings.Builder{}
-+			}
-+			if event.Output != "" {
-+				packageOutput[event.Package].WriteString(event.Output)
-+			}
-+			if event.Action == "fail" {
-+				packageFailed[event.Package] = true
-+			}
-+			continue
-+		}
-+
-+		key := event.Package + "\x00" + event.Test
-+		entry, seen := cases[key]
-+		if !seen {
-+			entry = &testCase{Name: event.Test, Package: event.Package, Order: order}
-+			order++
-+			cases[key] = entry
-+		}
-+
-+		if event.Output != "" {
-+			entry.Output.WriteString(event.Output)
-+		}
-+		switch event.Action {
-+		case "pass", "fail", "skip":
-+			entry.Action = event.Action
-+			entry.Elapsed = event.Elapsed
-+		}
-+	}
-+
-+	if err := scanner.Err(); err != nil {
-+		fmt.Fprintf(os.Stderr, "junitreport: could not read test output: %v\n", err)
-+	}
-+
-+	if *out == "" {
-+		return
-+	}
-+
-+	if err := writeReport(*out, cases, packageOutput, packageFailed, expect); err != nil {
-+		fmt.Fprintf(os.Stderr, "junitreport: could not write report: %v\n", err)
-+	}
-+}
-+
-+func writeReport(path string, cases map[string]*testCase, packageOutput map[string]*strings.Builder, packageFailed map[string]bool, expect expectations) error {
-+	byPackage := map[string][]*testCase{}
-+	for _, entry := range cases {
-+		byPackage[entry.Package] = append(byPackage[entry.Package], entry)
-+	}
-+
-+	// a package that failed without any failing test failed to build or panicked,
-+	// so none of its tests ever reported a result
-+	for pkg, failed := range packageFailed {
-+		if !failed {
-+			continue
-+		}
-+		hasFailure := false
-+		for _, entry := range byPackage[pkg] {
-+			if entry.Action == "fail" {
-+				hasFailure = true
-+				break
-+			}
-+		}
-+		if hasFailure {
-+			continue
-+		}
-+
-+		output := ""
-+		if builder, ok := packageOutput[pkg]; ok {
-+			output = builder.String()
-+		}
-+
-+		// the tests of the package did not run, which is a failure of each of
-+		// them; naming them individually keeps the report attributable instead
-+		// of inventing a case that belongs to no test
-+		names := expect[pkg]
-+		if len(names) == 0 {
-+			// nothing is known about the package, so the failure is recorded as
-+			// a skip: the process exit status still carries it, and a case that
-+			// names no real test would otherwise be unattributable
-+			skipped := &testCase{Name: "PackageFailure", Package: pkg, Action: "skip", Order: -1}
-+			skipped.Output.WriteString(output)
-+			byPackage[pkg] = append(byPackage[pkg], skipped)
-+
-+			continue
-+		}
-+
-+		seen := map[string]bool{}
-+		for _, entry := range byPackage[pkg] {
-+			seen[entry.Name] = true
-+		}
-+
-+		for i, name := range names {
-+			if seen[name] {
-+				continue
-+			}
-+
-+			missing := &testCase{Name: name, Package: pkg, Action: "fail", Order: -len(names) + i}
-+			missing.Output.WriteString(output)
-+			byPackage[pkg] = append(byPackage[pkg], missing)
-+		}
-+	}
-+
-+	packages := make([]string, 0, len(byPackage))
-+	for pkg := range byPackage {
-+		packages = append(packages, pkg)
-+	}
-+	sort.Strings(packages)
-+
-+	report := junitTestSuites{}
-+	for _, pkg := range packages {
-+		entries := byPackage[pkg]
-+		sort.Slice(entries, func(i, j int) bool { return entries[i].Order < entries[j].Order })
-+
-+		suite := junitTestSuite{Name: pkg}
-+		total := 0.0
-+		for _, entry := range entries {
-+			total += entry.Elapsed
-+			testcase := junitTestCase{
-+				Name:      entry.Name,
-+				ClassName: pkg,
-+				Time:      fmt.Sprintf("%.3f", entry.Elapsed),
-+			}
-+			switch entry.Action {
-+			case "fail":
-+				testcase.Failure = &junitFailure{
-+					Message: "Failed",
-+					Type:    "go.test.failure",
-+					Body:    scrub(entry.Output.String()),
-+				}
-+				suite.Failures++
-+			case "skip":
-+				testcase.Skipped = &junitSkipped{Message: "Skipped"}
-+				suite.Skipped++
-+			default:
-+				testcase.SystemOut = scrub(entry.Output.String())
-+			}
-+			suite.TestCases = append(suite.TestCases, testcase)
-+			suite.Tests++
-+		}
-+		suite.Time = fmt.Sprintf("%.3f", total)
-+		report.Tests += suite.Tests
-+		report.Failures += suite.Failures
-+		report.Suites = append(report.Suites, suite)
-+	}
-+
-+	encoded, err := xml.MarshalIndent(report, "", "  ")
-+	if err != nil {
-+		return err
-+	}
-+
-+	return os.WriteFile(path, append([]byte(xml.Header), append(encoded, '\n')...), 0644)
-+}
-+
-+// scrub drops the control characters that are not legal in XML character data.
-+func scrub(value string) string {
-+	return strings.Map(func(r rune) rune {
-+		if r == '\t' || r == '\n' || r == '\r' {
-+			return r
-+		}
-+		if r < 0x20 {
-+			return -1
-+		}
-+		return r
-+	}, value)
-+}
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..e2add8c
+index 0000000..f8bfa3b
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,78 @@
+@@ -0,0 +1,92 @@
 +#!/usr/bin/env bash
 +#
 +# Usage:
@@ -2557,12 +2572,20 @@ index 0000000..e2add8c
 +
 +case "$MODE" in
 +  base)
-+    PACKAGES=(./forms/ ./mails/ ./tools/search/ ./tools/dbutils/ ./tools/inflector/ ./tools/list/ ./tools/picker/)
++    # the suites of the packages the change touches are the regression gate, so
++    # they run in full; the soft delete tests live in their own package and are
++    # not part of it
++    PACKAGES=(./core/ ./apis/ ./forms/ ./mails/ ./tools/search/ ./tools/dbutils/ ./tools/inflector/ ./tools/list/ ./tools/picker/)
++    # TestRecordAuthWithOAuth2 downloads an avatar over the network, which is
++    # not available here. The rest build their subtest names out of pointer
++    # addresses and random file names, so the names differ between runs even
++    # though the results never do, which makes a report diff look unstable.
++    RUN_ARGS=(-skip '^(TestRecordAuthWithOAuth2|TestFileFieldDriverValue|TestFileFieldPrepareValue|TestRecordGetBool|TestRecordGetDateTime|TestRecordGetFloat|TestRecordGetInt|TestRecordGetInt64|TestRecordGetStringSlice)$')
 +    ;;
 +  new)
-+    PACKAGES=(./core/ ./apis/)
++    PACKAGES=(./softdeletetests/)
 +    RUN_ARGS=(-run '^TestSoftDelete')
-+    EXPECT_DIRS=(core apis)
++    EXPECT_DIRS=(softdeletetests)
 +    ;;
 +  *)
 +    echo "unknown mode: $MODE (expected base or new)" >&2
@@ -2596,6 +2619,12 @@ index 0000000..e2add8c
 +done
 +
 +go test -count=1 -json ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} "${PACKAGES[@]}" | go run ./scripts/junitreport ${REPORTER_ARGS[@]+"${REPORTER_ARGS[@]}"}
-+STATUS=${PIPESTATUS[0]}
++STATUS=("${PIPESTATUS[@]}")
 +
-+exit "$STATUS"
++# a run is only a success when the tests passed and the requested report was
++# actually written, so the reporter's status counts too
++if [ "${STATUS[0]}" -ne 0 ]; then
++  exit "${STATUS[0]}"
++fi
++
++exit "${STATUS[1]}"
