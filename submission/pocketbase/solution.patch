@@ -31,7 +31,7 @@ index 3f7367f..c2f7096 100644
  
  type BatchRequestResult struct {
 diff --git a/apis/realtime.go b/apis/realtime.go
-index d6d8b58..809f592 100644
+index d6d8b58..fbda95d 100644
 --- a/apis/realtime.go
 +++ b/apis/realtime.go
 @@ -440,7 +440,14 @@ func bindRealtimeEvents(app core.App) {
@@ -50,10 +50,10 @@ index d6d8b58..809f592 100644
  				if err != nil {
  					app.Logger().Debug(
  						"Failed to broadcast record update",
-@@ -591,6 +598,21 @@ type recordData struct {
- // to be performed against different db app context (e.g. out of a transaction).
- // If set, it is expected that optAccessCheckApp instance is used for read-only operations to avoid deadlocks.
- // If not set, it fallbacks to app.
+@@ -587,6 +594,21 @@ type recordData struct {
+ 	Action string `json:"action"`
+ }
+ 
 +// isRestoredRecord checks whether the just saved model is a record that was
 +// brought back from the trash.
 +//
@@ -69,9 +69,9 @@ index d6d8b58..809f592 100644
 +	return core.IsRestoreOperation(ctx)
 +}
 +
- func realtimeBroadcastRecord(app core.App, action string, record *core.Record, dryCache bool, optAccessCheckApp ...core.App) error {
- 	collection := record.Collection()
- 	if collection == nil {
+ // Note: the optAccessCheckApp is there in case you want the access check
+ // to be performed against different db app context (e.g. out of a transaction).
+ // If set, it is expected that optAccessCheckApp instance is used for read-only operations to avoid deadlocks.
 diff --git a/apis/record_crud.go b/apis/record_crud.go
 index 3a35e93..8f3ccb5 100644
 --- a/apis/record_crud.go
@@ -1002,10 +1002,10 @@ index 425cc5e..c44c206 100644
  	// replace existing
  	for i, j := range r.listRuleJoins {
 diff --git a/core/record_field_resolver_runner.go b/core/record_field_resolver_runner.go
-index fa65893..3026cd0 100644
+index fa65893..85039d1 100644
 --- a/core/record_field_resolver_runner.go
 +++ b/core/record_field_resolver_runner.go
-@@ -650,87 +650,104 @@ func (r *runner) processActiveProps() (*search.ResolverResult, error) {
+@@ -650,87 +650,124 @@ func (r *runner) processActiveProps() (*search.ResolverResult, error) {
  
  		// "id" lookups optimization for single relations to avoid unnecessary joins,
  		// aka. "user.id" and "user" should produce the same query identifier
@@ -1023,7 +1023,11 @@ index fa65893..3026cd0 100644
 -		prefixedFieldName := r.activeTableAlias + "." + cleanFieldName
 -		newTableAlias := r.activeTableAlias + "_" + cleanFieldName + r.resolver.joinAliasSuffix
 -		newCollectionName := relCollection.Name
--
++		if err := r.joinRelation(relField, relCollection); err != nil {
++			return nil, err
++		}
++	}
+ 
 -		if !relField.IsMultiple() {
 -			err := r.resolver.registerJoin(
 -				inflector.Columnify(newCollectionName),
@@ -1035,27 +1039,13 @@ index fa65893..3026cd0 100644
 -			}
 -		} else {
 -			jeAlias := "__je_" + newTableAlias
-+		if err := r.joinRelation(relField, relCollection); err != nil {
-+			return nil, err
-+		}
-+	}
++	return nil, fmt.Errorf("failed to resolve field %q", r.fieldName)
++}
  
 -			err := r.resolver.registerJoin(dbutils.JSONEach(prefixedFieldName), jeAlias, nil)
 -			if err != nil {
 -				return nil, err
 -			}
-+	return nil, fmt.Errorf("failed to resolve field %q", r.fieldName)
-+}
- 
--			err = r.resolver.registerJoin(
--				inflector.Columnify(newCollectionName),
--				newTableAlias,
--				dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s.value]]", newTableAlias, jeAlias)),
--			)
--			if err != nil {
--				return nil, err
--			}
--		}
 +// joinRelation joins the collection targeted by the provided relation field to
 +// the main query and to the multi-match subquery, and moves the runner active
 +// aliases to it so that the next prop is resolved against the related table.
@@ -1065,9 +1055,14 @@ index fa65893..3026cd0 100644
 +	newTableAlias := r.activeTableAlias + "_" + cleanFieldName + r.resolver.joinAliasSuffix
 +	newCollectionName := relCollection.Name
  
--		r.activeCollectionName = newCollectionName
--		r.activeTableAlias = newTableAlias
--		// ---
+-			err = r.resolver.registerJoin(
+-				inflector.Columnify(newCollectionName),
+-				newTableAlias,
+-				dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s.value]]", newTableAlias, jeAlias)),
+-			)
+-			if err != nil {
+-				return nil, err
+-			}
 +	// join the relation to the main query
 +	// ---
 +	if !relField.IsMultiple() {
@@ -1078,10 +1073,14 @@ index fa65893..3026cd0 100644
 +		)
 +		if err != nil {
 +			return err
-+		}
+ 		}
 +	} else {
 +		jeAlias := "__je_" + newTableAlias
  
+-		r.activeCollectionName = newCollectionName
+-		r.activeTableAlias = newTableAlias
+-		// ---
+-
 -		// join the relation to the multi-match subquery
 -		// ---
 -		if relField.IsMultiple() {
@@ -1172,10 +1171,30 @@ index fa65893..3026cd0 100644
 +	// ---
 +
 +	return nil
++}
++
++// softDeleteRelationTarget reports whether the provided field is a relation to
++// a collection that hides its trashed records, and returns that collection.
++func (r *runner) softDeleteRelationTarget(field Field) (bool, *Collection, error) {
++	relField, ok := field.(*RelationField)
++	if !ok {
++		return false, nil, nil
++	}
++
++	relCollection, err := r.resolver.loadCollection(relField.CollectionId)
++	if err != nil {
++		return false, nil, fmt.Errorf("failed to load field %q collection", field.GetName())
++	}
++
++	if !relCollection.IsSoftDeleteEnabled() {
++		return false, nil, nil
++	}
++
++	return true, relCollection, nil
  }
  
  func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop string, propDepth int) (*search.ResolverResult, error) {
-@@ -751,6 +768,34 @@ func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop stri
+@@ -751,6 +788,34 @@ func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop stri
  		return nil, fmt.Errorf("non-filterable field %q", name)
  	}
  
@@ -1210,8 +1229,66 @@ index fa65893..3026cd0 100644
  	multvaluer, isMultivaluer := field.(MultiValuer)
  
  	cleanFieldName := inflector.Columnify(field.GetName())
+@@ -784,8 +849,38 @@ func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop stri
+ 			return nil, err
+ 		}
+ 
++		// relations to a soft delete enabled collection
++		// -------------------------------------------------------
++		// json_each walks the stored ids, which keep listing the targets that
++		// went to the trash, and the exclusion cannot be hung off that join
++		// because its table is the json_each expression rather than the
++		// related table. Joining the related table turns each extracted id
++		// back into a row that the exclusion can drop, so ":each" hides the
++		// same targets as every other relation form.
++		trashAware, relCollection, err := r.softDeleteRelationTarget(field)
++		if err != nil {
++			return nil, err
++		}
++
++		identifier := fmt.Sprintf("[[%s.value]]", jeAlias)
++
++		if trashAware {
++			relAlias := jeAlias + "_rel"
++
++			err = r.resolver.registerJoin(
++				inflector.Columnify(relCollection.Name),
++				relAlias,
++				dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s.value]]", relAlias, jeAlias)),
++			)
++			if err != nil {
++				return nil, err
++			}
++
++			identifier = fmt.Sprintf("[[%s.id]]", relAlias)
++		}
++
+ 		result := &search.ResolverResult{
+-			Identifier: fmt.Sprintf("[[%s.value]]", jeAlias),
++			Identifier: identifier,
+ 		}
+ 
+ 		if multvaluer.IsMultiple() {
+@@ -802,6 +897,17 @@ func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop stri
+ 			})
+ 			r.multiMatch.ValueIdentifier = fmt.Sprintf("[[%s.value]]", jeAlias2)
+ 
++			if trashAware {
++				relAlias2 := jeAlias2 + "_rel"
++
++				r.multiMatch.Joins = append(r.multiMatch.Joins, &search.Join{
++					TableName:  inflector.Columnify(relCollection.Name),
++					TableAlias: relAlias2,
++					On:         dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s.value]]", relAlias2, jeAlias2)),
++				})
++				r.multiMatch.ValueIdentifier = fmt.Sprintf("[[%s.id]]", relAlias2)
++			}
++
+ 			result.MultiMatchSubQuery = r.multiMatch
+ 		}
+ 
 diff --git a/core/record_model.go b/core/record_model.go
-index b654864..f3e386b 100644
+index b654864..ce4391d 100644
 --- a/core/record_model.go
 +++ b/core/record_model.go
 @@ -50,6 +50,10 @@ type Record struct {
@@ -1236,7 +1313,7 @@ index b654864..f3e386b 100644
  	errs := validation.Errors{}
  
  	for _, f := range e.Record.Collection().Fields {
-@@ -1488,6 +1496,20 @@ func onRecordSaveExecute(e *RecordEvent) error {
+@@ -1488,6 +1496,26 @@ func onRecordSaveExecute(e *RecordEvent) error {
  }
  
  func onRecordDeleteExecute(e *RecordEvent) error {
@@ -1251,13 +1328,19 @@ index b654864..f3e386b 100644
 +	if e.Record.Collection().IsSoftDeleteEnabled() &&
 +		!isPurgeContext(e.Context) &&
 +		!e.Record.IsTrashed() {
-+		return trashRecord(e)
++		trashed, err := trashRecord(e)
++		if err != nil || trashed {
++			return err
++		}
++
++		// the row turned out to be in the trash already, so this delete is
++		// the second one and falls through to the permanent delete below
 +	}
 +
  	// fetch rel references (if any)
  	//
  	// note: the select is outside of the transaction to minimize
-@@ -1507,57 +1529,77 @@ func onRecordDeleteExecute(e *RecordEvent) error {
+@@ -1507,57 +1535,77 @@ func onRecordDeleteExecute(e *RecordEvent) error {
  			return err
  		}
  
@@ -1362,7 +1445,7 @@ index b654864..f3e386b 100644
  
  			// trigger cascade for each batchSize rel items until there is none
  			batchSize := 8000
-@@ -1573,7 +1615,7 @@ func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Fie
+@@ -1573,7 +1621,7 @@ func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Fie
  					break
  				}
  
@@ -1371,7 +1454,7 @@ index b654864..f3e386b 100644
  				if err != nil {
  					return err
  				}
-@@ -1595,14 +1637,16 @@ func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Fie
+@@ -1595,14 +1643,16 @@ func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Fie
  // just unset the record id from any relation field values (if they are not required).
  //
  // NB! This method is expected to be called from inside of a transaction.
@@ -1390,7 +1473,7 @@ index b654864..f3e386b 100644
  		if err != nil {
  			if errors.Is(err, sql.ErrNoRows) {
  				continue // already deleted
-@@ -1623,7 +1667,7 @@ func deleteRefRecords(app App, mainRecord *Record, refCollection *Collection, re
+@@ -1623,7 +1673,7 @@ func deleteRefRecords(app App, mainRecord *Record, refCollection *Collection, re
  		// cascade delete the reference
  		// (only if there are no other active references in case of multiple select)
  		if relField.CascadeDelete && len(ids) == 0 {
@@ -1576,10 +1659,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..6693217
+index 0000000..737433f
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,799 @@
+@@ -0,0 +1,882 @@
 +package core
 +
 +import (
@@ -1804,12 +1887,12 @@ index 0000000..6693217
 +//
 +// NB! It is expected to be called only for collections with the soft delete
 +// mode enabled and from within the record delete execute hook.
-+func trashRecord(e *RecordEvent) error {
++func trashRecord(e *RecordEvent) (bool, error) {
 +	// note: the select is outside of the transaction to minimize
 +	// SQLITE_BUSY errors when mixing read&write in a single transaction
 +	refs, err := e.App.FindCachedCollectionReferences(e.Record.Collection())
 +	if err != nil {
-+		return err
++		return false, err
 +	}
 +
 +	// every record trashed as part of this delete shares the same timestamp
@@ -1833,8 +1916,19 @@ index 0000000..6693217
 +	})
 +	e.App = originalApp
 +
-+	return txErr
++	if errors.Is(txErr, errRecordAlreadyTrashed) {
++		return false, nil
++	}
++
++	return true, txErr
 +}
++
++// errRecordAlreadyTrashed reports that the row behind the deleted record was
++// found in the trash, so the delete has to remove it for good.
++//
++// It travels out of the trash transaction to roll it back; nothing is written
++// before the check, so there is nothing to undo.
++var errRecordAlreadyTrashed = errors.New("the record row is already trashed")
 +
 +// trashRecordExecute stamps the trash timestamp of the deleted record
 +// instead of removing its row.
@@ -1846,17 +1940,34 @@ index 0000000..6693217
 +		return errors.New("the record can be trashed only if it is existing and has a non-empty primary key")
 +	}
 +
++	// the row is stamped only while it is still live
++	// -------------------------------------------------------
++	// the caller can be holding an instance loaded before another one trashed
++	// the same row, and that instance still reports itself as live. Letting
++	// the update decide keeps the "deleting a trashed record removes it"
++	// promise tied to the persisted state instead of an in-memory guess.
++	var affected int64
++
 +	err := baseLockRetry(func(attempt int) error {
-+		_, execErr := e.App.NonconcurrentDB().Update(
++		res, execErr := e.App.NonconcurrentDB().Update(
 +			collection.Name,
 +			dbx.Params{FieldNameDeleted: trashedAt.String()},
-+			dbx.HashExp{idColumn: pk},
++			dbx.HashExp{idColumn: pk, FieldNameDeleted: ""},
 +		).WithContext(e.Context).Execute()
++		if execErr != nil {
++			return execErr
++		}
++
++		affected, execErr = res.RowsAffected()
 +
 +		return execErr
 +	}, defaultMaxLockRetries)
 +	if err != nil {
 +		return err
++	}
++
++	if affected == 0 {
++		return errRecordAlreadyTrashed
 +	}
 +
 +	// reflect the new state in the in-memory model so that the after-delete
@@ -2035,6 +2146,50 @@ index 0000000..6693217
 +	return collectionId + "/" + recordId
 +}
 +
++// collectCascadeTargets adds the records that the provided one cascade-depends
++// on to the restore group, as long as they carry its trash timestamp.
++//
++// A target that was already in the trash before the group went there carries a
++// different timestamp and stays behind, where the dependency check turns it
++// into a blocked restore rather than a silent one.
++func collectCascadeTargets(app App, record *Record, trashedAt types.DateTime, seen map[string]bool, group *[]*Record) error {
++	for _, field := range record.Collection().Fields {
++		relField, ok := field.(*RelationField)
++		if !ok || !relField.CascadeDelete {
++			continue
++		}
++
++		relCollection, err := app.FindCachedCollectionByNameOrId(relField.CollectionId)
++		if err != nil || relCollection == nil || !relCollection.IsSoftDeleteEnabled() {
++			continue
++		}
++
++		for _, relId := range record.GetStringSlice(relField.Name) {
++			key := restoreGroupKey(relCollection.Id, relId)
++			if seen[key] {
++				continue
++			}
++
++			relRecord, err := app.FindTrashedRecordById(relCollection, relId)
++			if err != nil {
++				if errors.Is(err, sql.ErrNoRows) {
++					continue // already live, or gone for good
++				}
++				return err
++			}
++
++			if relRecord.TrashedAt().String() != trashedAt.String() {
++				continue // trashed on its own, so not part of this group
++			}
++
++			seen[key] = true
++			*group = append(*group, relRecord)
++		}
++	}
++
++	return nil
++}
++
 +// collectRestoreGroup gathers the records that went to the trash together with
 +// the provided one, aka. the ones reachable through the "cascade delete"
 +// relations that carry its exact trash timestamp.
@@ -2055,6 +2210,17 @@ index 0000000..6693217
 +	// in by a member are visited as well
 +	for i := 0; i < len(group); i++ {
 +		current := group[i]
++
++		// the records the current one followed into the trash
++		// -------------------------------------------------------
++		// walking only the incoming references would make the group depend on
++		// where the restore starts: a cascade child would collect nothing and
++		// then be blocked by its own still trashed parent. Following the
++		// cascade relations in both directions makes the group the same set
++		// from any of its members.
++		if err := collectCascadeTargets(app, current, trashedAt, seen, &group); err != nil {
++			return nil, err
++		}
 +
 +		refs, err := app.FindCachedCollectionReferences(current.Collection())
 +		if err != nil {
