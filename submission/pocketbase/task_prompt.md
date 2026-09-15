@@ -4,7 +4,7 @@ Add per-collection `softDelete` (boolean) and `trashRetention` (seconds; 0 keeps
 
 `App.Delete` on a trashed record permanently removes it. `App.PurgeRecord` permanently deletes a live record. Both recursively cascade to referencing records, already trashed ones included.
 
-Trashed records are excluded from normal reads, relations, back-relations, `@collection` filters, and relation expands. Relation filters must exclude trashed targets, whether written as `rel` or `rel.id`. Access them via `App.FindRecordByIdWithTrashed`, `App.FindTrashedRecordById`, and `App.FindAllTrashedRecords` (the last two error without `softDelete`). Records answer `IsTrashed` and `TrashedAt`, and saving a trashed record fails validation.
+Trashed records are excluded from normal reads, relations, back-relations, `@collection` filters, and relation expands. A view reading a soft-delete collection is refused, whichever is created first, since its SQL would expose trashed rows. Relation filters must exclude trashed targets, whether written as `rel` or `rel.id`. Access them via `App.FindRecordByIdWithTrashed`, `App.FindTrashedRecordById`, and `App.FindAllTrashedRecords` (the last two error without `softDelete`). Records answer `IsTrashed` and `TrashedAt`, and saving a trashed record fails validation.
 
 With `softDelete` enabled, unique indexes exclude trashed rows while keeping index definitions unchanged; disabling gives the earlier expressions back.
 

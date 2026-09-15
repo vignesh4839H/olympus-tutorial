@@ -476,10 +476,10 @@ index 1bbec9c..8a47094 100644
  	// If no records are found, returns an empty slice.
  	FindRecordsByIds(collectionModelOrIdentifier any, recordIds []string, optFilters ...func(q *dbx.SelectQuery) error) ([]*Record, error)
 diff --git a/core/base.go b/core/base.go
-index 3d0f41c..2902c6c 100644
+index 3d0f41c..5dcd8dd 100644
 --- a/core/base.go
 +++ b/core/base.go
-@@ -1348,6 +1348,17 @@ func supportFiles(m Model) bool {
+@@ -1348,6 +1348,29 @@ func supportFiles(m Model) bool {
  	return false
  }
  
@@ -488,16 +488,28 @@ index 3d0f41c..2902c6c 100644
 +//
 +// A record loaded out of the trash and then purged is not a transition, so its
 +// files must still be cleaned up.
++// isTrashedModel reports whether the delete that just ran moved the model to
++// the trash rather than removing it.
++//
++// A proxy is unwrapped the same way the neighbouring file support check does
++// it: the delete hooks run against the proxied record and mark that one, so a
++// proxy left unexamined would look like a permanent delete and cost the record
++// its files.
 +func isTrashedModel(m Model) bool {
-+	record, ok := m.(*Record)
++	switch v := m.(type) {
++	case *Record:
++		return v.trashTransition
++	case RecordProxy:
++		return v.ProxyRecord() != nil && v.ProxyRecord().trashTransition
++	}
 +
-+	return ok && record.trashTransition
++	return false
 +}
 +
  func (app *BaseApp) registerBaseHooks() {
  	deletePrefix := func(prefix string) error {
  		fs, err := app.NewFilesystem()
-@@ -1375,7 +1386,9 @@ func (app *BaseApp) registerBaseHooks() {
+@@ -1375,7 +1398,9 @@ func (app *BaseApp) registerBaseHooks() {
  	app.OnModelAfterDeleteSuccess().Bind(&hook.Handler[*ModelEvent]{
  		Id: "__pbFilesManagerDelete__",
  		Func: func(e *ModelEvent) error {
@@ -508,7 +520,7 @@ index 3d0f41c..2902c6c 100644
  				// ensure that there is a trailing slash so that the list iterator could start walking from the prefix dir
  				// (https://github.com/pocketbase/pocketbase/discussions/5246#discussioncomment-10128955)
  				prefix := strings.TrimRight(m.BaseFilesPath(), "/") + "/"
-@@ -1593,6 +1606,13 @@ func (app *BaseApp) initLogger() error {
+@@ -1593,6 +1618,13 @@ func (app *BaseApp) initLogger() error {
  		Priority: -999,
  	})
  
@@ -819,10 +831,29 @@ index 93967c5..149a9ba 100644
  				errs[strconv.Itoa(i)] = validation.NewError(
  					"validation_invalid_index_expression",
 diff --git a/core/collection_validate.go b/core/collection_validate.go
-index a63b503..670db20 100644
+index a63b503..021d4ab 100644
 --- a/core/collection_validate.go
 +++ b/core/collection_validate.go
-@@ -422,6 +422,33 @@ func (cv *collectionValidator) checkMinFields(value any) error {
+@@ -325,6 +325,18 @@ func (cv *collectionValidator) checkViewQuery(value any) error {
+ 		return validation.NewError("validation_invalid_view_query", "Invalid query - "+rawErr)
+ 	}
+ 
++	source, err := viewQueryReadsSoftDelete(cv.app, v)
++	if err != nil {
++		return err
++	}
++
++	if source != "" {
++		return validation.NewError(
++			"validation_view_query_soft_delete_source",
++			`Invalid query - the "`+source+`" collection has the soft delete mode enabled and a view would read its trashed records.`,
++		)
++	}
++
+ 	return nil
+ }
+ 
+@@ -422,6 +434,46 @@ func (cv *collectionValidator) checkMinFields(value any) error {
  	return nil
  }
  
@@ -850,13 +881,26 @@ index a63b503..670db20 100644
 +		)
 +	}
 +
++	// a view reads the table directly, so it would return the trashed rows
++	dependant, err := softDeleteViewDependant(validator.app, validator.new)
++	if err != nil {
++		return err
++	}
++
++	if dependant != "" {
++		return validation.NewError(
++			"validation_soft_delete_view_dependant",
++			`The soft delete mode cannot be enabled while the "`+dependant+`" view reads this collection.`,
++		)
++	}
++
 +	return nil
 +}
 +
  func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) error {
  	fields, ok := value.(FieldsList)
  	if !ok {
-@@ -437,6 +464,13 @@ func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) erro
+@@ -437,6 +489,13 @@ func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) erro
  			continue
  		}
  
@@ -870,7 +914,7 @@ index a63b503..670db20 100644
  		newField := fields.GetById(oldField.GetId())
  
  		if newField == nil || oldField.GetName() != newField.GetName() {
-@@ -692,6 +726,8 @@ func (validator *collectionValidator) validateOptions() error {
+@@ -692,6 +751,8 @@ func (validator *collectionValidator) validateOptions() error {
  		return validator.new.collectionAuthOptions.validate(validator)
  	case CollectionTypeView:
  		return validator.new.collectionViewOptions.validate(validator)
@@ -1532,10 +1576,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..7536a12
+index 0000000..6693217
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,734 @@
+@@ -0,0 +1,799 @@
 +package core
 +
 +import (
@@ -1543,6 +1587,7 @@ index 0000000..7536a12
 +	"database/sql"
 +	"errors"
 +	"fmt"
++	"sort"
 +	"sync"
 +	"time"
 +
@@ -1676,6 +1721,70 @@ index 0000000..7536a12
 +	}
 +
 +	return m.GetDateTime(FieldNameDeleted)
++}
++
++// viewQueryReadsSoftDelete reports whether the provided view query selects from
++// a collection whose records can be in the trash.
++//
++// A view is stored as plain SQL over the source table, so it reads the trashed
++// rows straight through and none of the record query exclusions apply to it.
++// Rather than rewrite arbitrary user SQL, the pairing is refused outright, and
++// the visibility contract holds for every ordinary read.
++func viewQueryReadsSoftDelete(app App, selectQuery string) (string, error) {
++	if selectQuery == "" {
++		return "", nil
++	}
++
++	parser := new(identifiersParser)
++	if err := parser.parse(selectQuery); err != nil {
++		return "", nil // an unparsable query is reported by the query validation itself
++	}
++
++	sources, err := findCollectionsByIdentifiers(app, parser.tables)
++	if err != nil {
++		return "", err
++	}
++
++	// the sources are keyed by identifier, so the names are collected and
++	// sorted to keep the reported one stable
++	names := make([]string, 0, len(sources))
++	for _, source := range sources {
++		if source != nil && source.IsSoftDeleteEnabled() {
++			names = append(names, source.Name)
++		}
++	}
++
++	if len(names) == 0 {
++		return "", nil
++	}
++
++	sort.Strings(names)
++
++	return names[0], nil
++}
++
++// softDeleteViewDependant returns the name of an existing view that reads the
++// provided collection, if there is one.
++func softDeleteViewDependant(app App, collection *Collection) (string, error) {
++	views, err := app.FindAllCollections(CollectionTypeView)
++	if err != nil {
++		return "", err
++	}
++
++	for _, view := range views {
++		parser := new(identifiersParser)
++		if err := parser.parse(view.ViewQuery); err != nil {
++			continue
++		}
++
++		for _, table := range parser.tables {
++			if table.original == collection.Name {
++				return view.Name, nil
++			}
++		}
++	}
++
++	return "", nil
 +}
 +
 +// notTrashedExpr returns the expression matching only the records of the

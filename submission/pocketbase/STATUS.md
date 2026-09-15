@@ -17,7 +17,7 @@
 
 ## Measured results
 
-- **740 meaningful production LOC** added by the solution patch (blank lines,
+- **786 meaningful production LOC** added by the solution patch (blank lines,
   comments, imports, braces and test files excluded).
 - **104 graded test cases** in the `softdeletetests` package, with 3802 existing
   `core`, `apis`, `forms`, `mails` and `tools` cases as the regression gate.
