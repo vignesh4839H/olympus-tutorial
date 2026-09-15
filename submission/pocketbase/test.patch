@@ -2703,10 +2703,10 @@ index 0000000..3c245ec
 +}
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..f8bfa3b
+index 0000000..f6a88ba
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,92 @@
+@@ -0,0 +1,95 @@
 +#!/usr/bin/env bash
 +#
 +# Usage:
@@ -2748,10 +2748,13 @@ index 0000000..f8bfa3b
 +    # not part of it
 +    PACKAGES=(./core/ ./apis/ ./forms/ ./mails/ ./tools/search/ ./tools/dbutils/ ./tools/inflector/ ./tools/list/ ./tools/picker/)
 +    # TestRecordAuthWithOAuth2 downloads an avatar over the network, which is
-+    # not available here. The rest build their subtest names out of pointer
-+    # addresses and random file names, so the names differ between runs even
-+    # though the results never do, which makes a report diff look unstable.
-+    RUN_ARGS=(-skip '^(TestRecordAuthWithOAuth2|TestFileFieldDriverValue|TestFileFieldPrepareValue|TestRecordGetBool|TestRecordGetDateTime|TestRecordGetFloat|TestRecordGetInt|TestRecordGetInt64|TestRecordGetStringSlice)$')
++    # not available here. The two TestNotifyWatcher cases wait on a filesystem
++    # watcher shared by two apps within a fixed one to three second budget, so
++    # they turn on how loaded the machine is rather than on the code. The rest
++    # build their subtest names out of pointer addresses and random file names,
++    # so the names differ between runs even though the results never do, which
++    # makes a report diff look unstable.
++    RUN_ARGS=(-skip '^(TestRecordAuthWithOAuth2|TestNotifyWatcher_CollectionsUpdate|TestNotifyWatcher_SettingsUpdate|TestFileFieldDriverValue|TestFileFieldPrepareValue|TestRecordGetBool|TestRecordGetDateTime|TestRecordGetFloat|TestRecordGetInt|TestRecordGetInt64|TestRecordGetStringSlice)$')
 +    ;;
 +  new)
 +    PACKAGES=(./softdeletetests/)
