@@ -813,6 +813,41 @@ index 924312b..bf9e708 100644
 +		),
 +	)
  }
+diff --git a/core/collection_query.go b/core/collection_query.go
+index 3821067..70a8e41 100644
+--- a/core/collection_query.go
++++ b/core/collection_query.go
+@@ -218,6 +218,10 @@ func (app *BaseApp) IsCollectionNameUnique(name string, excludeIds ...string) bo
+ //
+ // Note that this method will also trigger the records related
+ // cascade and file delete actions.
++//
++// The trash is emptied along with the rest: a truncate removes every record
++// of the collection, so the soft delete mode cannot turn it into a delete
++// that leaves the rows and their files behind.
+ func (app *BaseApp) TruncateCollection(collection *Collection) error {
+ 	if collection.IsView() {
+ 		return errors.New("view collections cannot be truncated since they don't store their own records")
+@@ -227,7 +231,9 @@ func (app *BaseApp) TruncateCollection(collection *Collection) error {
+ 		records := make([]*Record, 0, 500)
+ 
+ 		for {
+-			err := txApp.RecordQuery(collection).Limit(500).All(&records)
++			// the query has to see the trashed records too, otherwise they are
++			// never selected and the loop ends with rows still in the table
++			err := txApp.RecordQueryWithTrashed(collection).Limit(500).All(&records)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -237,7 +243,7 @@ func (app *BaseApp) TruncateCollection(collection *Collection) error {
+ 			}
+ 
+ 			for _, record := range records {
+-				err = txApp.Delete(record)
++				err = txApp.PurgeRecord(record)
+ 				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+ 					return err
+ 				}
 diff --git a/core/collection_record_table_sync.go b/core/collection_record_table_sync.go
 index 93967c5..149a9ba 100644
 --- a/core/collection_record_table_sync.go
@@ -1659,10 +1694,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..737433f
+index 0000000..9ae2b88
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,882 @@
+@@ -0,0 +1,966 @@
 +package core
 +
 +import (
@@ -1671,6 +1706,7 @@ index 0000000..737433f
 +	"errors"
 +	"fmt"
 +	"sort"
++	"strings"
 +	"sync"
 +	"time"
 +
@@ -1716,9 +1752,11 @@ index 0000000..737433f
 +// deletes could otherwise end up sharing one and a restore could bring back
 +// records that have nothing to do with the restored one.
 +//
-+// To avoid that, the returned value is always strictly greater than the one
-+// returned by the previous call.
-+func nextTrashTimestamp() types.DateTime {
++// The returned value is therefore always strictly greater than the one
++// returned by the previous call and, since that marker starts empty in every
++// new process and the system clock can be moved back, is also checked against
++// the stamps that already reached the database.
++func nextTrashTimestamp(app App) (types.DateTime, error) {
 +	trashTimestampMu.Lock()
 +	defer trashTimestampMu.Unlock()
 +
@@ -1730,9 +1768,58 @@ index 0000000..737433f
 +		now = lastTrashTimestamp.Add(1 * time.Millisecond)
 +	}
 +
++	for {
++		taken, err := trashTimestampTaken(app, now)
++		if err != nil {
++			return types.DateTime{}, err
++		}
++
++		if !taken {
++			break
++		}
++
++		now = now.Add(1 * time.Millisecond)
++	}
++
 +	lastTrashTimestamp = now
 +
-+	return now
++	return now, nil
++}
++
++// trashTimestampTaken reports whether a record is already sitting in the trash
++// under the provided timestamp.
++//
++// Only the soft delete collections are looked at: the others have no trash and
++// no "deleted" column to look at in the first place.
++func trashTimestampTaken(app App, trashedAt types.DateTime) (bool, error) {
++	collections, err := app.FindAllCollections(CollectionTypeBase)
++	if err != nil {
++		return false, err
++	}
++
++	for _, collection := range collections {
++		if !collection.IsSoftDeleteEnabled() {
++			continue
++		}
++
++		var total int
++
++		err := app.ConcurrentDB().
++			Select("count(*)").
++			From(collection.Name).
++			AndWhere(dbx.HashExp{FieldNameDeleted: trashedAt.String()}).
++			Limit(1).
++			Row(&total)
++		if err != nil {
++			return false, err
++		}
++
++		if total > 0 {
++			return true, nil
++		}
++	}
++
++	return false, nil
 +}
 +
 +// restoreContextKey marks the single save performed by RestoreRecord, so that
@@ -1823,15 +1910,20 @@ index 0000000..737433f
 +		return "", nil // an unparsable query is reported by the query validation itself
 +	}
 +
-+	sources, err := findCollectionsByIdentifiers(app, parser.tables)
-+	if err != nil {
-+		return "", err
-+	}
++	// the sources are resolved one by one rather than through
++	// findCollectionsByIdentifiers, which matches the parsed identifier
++	// against the stored name exactly. SQLite resolves table names without
++	// regard to case and so does every other collection lookup here, so a
++	// view selecting from "Posts" reads the "posts" rows and has to be seen
++	// as reading them.
++	names := make([]string, 0, len(parser.tables))
 +
-+	// the sources are keyed by identifier, so the names are collected and
-+	// sorted to keep the reported one stable
-+	names := make([]string, 0, len(sources))
-+	for _, source := range sources {
++	for _, table := range parser.tables {
++		source, err := findViewSourceCollection(app, table)
++		if err != nil {
++			return "", err
++		}
++
 +		if source != nil && source.IsSoftDeleteEnabled() {
 +			names = append(names, source.Name)
 +		}
@@ -1841,9 +1933,32 @@ index 0000000..737433f
 +		return "", nil
 +	}
 +
++	// the identifier order is not meaningful, so the reported name is the
++	// first in a stable one
 +	sort.Strings(names)
 +
 +	return names[0], nil
++}
++
++// findViewSourceCollection resolves a table identifier of a view query to the
++// collection it reads, ignoring the identifier case the way SQLite does.
++//
++// A missing collection is not an error here: the identifier can name a CTE, a
++// subquery or a plain table, none of which hold records.
++func findViewSourceCollection(app App, table identifier) (*Collection, error) {
++	if strings.Contains(table.alias, "(") {
++		return nil, nil // an expression rather than a table
++	}
++
++	collection, err := app.FindCachedCollectionByNameOrId(table.original)
++	if err != nil {
++		if errors.Is(err, sql.ErrNoRows) {
++			return nil, nil
++		}
++		return nil, err
++	}
++
++	return collection, nil
 +}
 +
 +// softDeleteViewDependant returns the name of an existing view that reads the
@@ -1861,7 +1976,8 @@ index 0000000..737433f
 +		}
 +
 +		for _, table := range parser.tables {
-+			if table.original == collection.Name {
++			// matched without regard to case for the same reason as above
++			if strings.EqualFold(table.original, collection.Name) {
 +				return view.Name, nil
 +			}
 +		}
@@ -1899,7 +2015,10 @@ index 0000000..737433f
 +	// so that a later restore can bring back exactly the same group
 +	trashedAt, ok := trashTimestampFromContext(e.Context)
 +	if !ok {
-+		trashedAt = nextTrashTimestamp()
++		trashedAt, err = nextTrashTimestamp(e.App)
++		if err != nil {
++			return false, err
++		}
 +	}
 +
 +	ctx := withTrashTimestamp(e.Context, trashedAt)
@@ -2564,9 +2683,15 @@ index 16df0ec..61859e2 100644
  
  	// load the special auth form fields
 diff --git a/plugins/jsvm/internal/types/generated/types.d.ts b/plugins/jsvm/internal/types/generated/types.d.ts
-index e563f42..a74a6f7 100644
+index e563f42..9429ff0 100644
 --- a/plugins/jsvm/internal/types/generated/types.d.ts
 +++ b/plugins/jsvm/internal/types/generated/types.d.ts
+@@ -1,4 +1,4 @@
+-// 1788714636
++// 1789459576
+ // GENERATED CODE - DO NOT MODIFY BY HAND
+ 
+ // -------------------------------------------------------------------
 @@ -6710,12 +6710,86 @@ namespace core {
     * In case a collection id or name is provided and that collection doesn't
     * actually exists, the generated query will be created with a cancelled context
