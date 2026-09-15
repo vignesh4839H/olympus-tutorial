@@ -870,7 +870,7 @@ index 93967c5..149a9ba 100644
  				errs[strconv.Itoa(i)] = validation.NewError(
  					"validation_invalid_index_expression",
 diff --git a/core/collection_validate.go b/core/collection_validate.go
-index a63b503..021d4ab 100644
+index a63b503..9976e3d 100644
 --- a/core/collection_validate.go
 +++ b/core/collection_validate.go
 @@ -325,6 +325,18 @@ func (cv *collectionValidator) checkViewQuery(value any) error {
@@ -892,7 +892,7 @@ index a63b503..021d4ab 100644
  	return nil
  }
  
-@@ -422,6 +434,46 @@ func (cv *collectionValidator) checkMinFields(value any) error {
+@@ -422,6 +434,56 @@ func (cv *collectionValidator) checkMinFields(value any) error {
  	return nil
  }
  
@@ -911,6 +911,16 @@ index a63b503..021d4ab 100644
 +
 +	if validator.original.SoftDelete {
 +		return nil // already on, so the field is the one this mode created
++	}
++
++	// the system collections back the auth machinery, and its internal
++	// cleanups delete their records expecting the rows to go: leaving them in
++	// a trash would keep spent one-time passwords, mfa and oauth2 rows alive
++	if validator.new.System {
++		return validation.NewError(
++			"validation_soft_delete_system_collection",
++			"The soft delete mode cannot be enabled on a system collection.",
++		)
 +	}
 +
 +	if validator.new.ownDeletedField {
@@ -939,7 +949,7 @@ index a63b503..021d4ab 100644
  func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) error {
  	fields, ok := value.(FieldsList)
  	if !ok {
-@@ -437,6 +489,13 @@ func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) erro
+@@ -437,6 +499,13 @@ func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) erro
  			continue
  		}
  
@@ -953,7 +963,7 @@ index a63b503..021d4ab 100644
  		newField := fields.GetById(oldField.GetId())
  
  		if newField == nil || oldField.GetName() != newField.GetName() {
-@@ -692,6 +751,8 @@ func (validator *collectionValidator) validateOptions() error {
+@@ -692,6 +761,8 @@ func (validator *collectionValidator) validateOptions() error {
  		return validator.new.collectionAuthOptions.validate(validator)
  	case CollectionTypeView:
  		return validator.new.collectionViewOptions.validate(validator)
