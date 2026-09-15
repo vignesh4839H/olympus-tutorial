@@ -480,20 +480,16 @@ index 1bbec9c..8a47094 100644
  	// If no records are found, returns an empty slice.
  	FindRecordsByIds(collectionModelOrIdentifier any, recordIds []string, optFilters ...func(q *dbx.SelectQuery) error) ([]*Record, error)
 diff --git a/core/base.go b/core/base.go
-index 3d0f41c..5dcd8dd 100644
+index 3d0f41c..b112abc 100644
 --- a/core/base.go
 +++ b/core/base.go
-@@ -1348,6 +1348,29 @@ func supportFiles(m Model) bool {
+@@ -1348,6 +1348,25 @@ func supportFiles(m Model) bool {
  	return false
  }
  
-+// isTrashedModel checks whether this particular delete moved the record into
-+// the trash rather than removing its row.
-+//
-+// A record loaded out of the trash and then purged is not a transition, so its
-+// files must still be cleaned up.
 +// isTrashedModel reports whether the delete that just ran moved the model to
-+// the trash rather than removing it.
++// the trash rather than removing it. A record loaded out of the trash and then
++// purged is not such a transition, so its files still have to be cleaned up.
 +//
 +// A proxy is unwrapped the same way the neighbouring file support check does
 +// it: the delete hooks run against the proxied record and mark that one, so a
@@ -513,7 +509,7 @@ index 3d0f41c..5dcd8dd 100644
  func (app *BaseApp) registerBaseHooks() {
  	deletePrefix := func(prefix string) error {
  		fs, err := app.NewFilesystem()
-@@ -1375,7 +1398,9 @@ func (app *BaseApp) registerBaseHooks() {
+@@ -1375,7 +1394,9 @@ func (app *BaseApp) registerBaseHooks() {
  	app.OnModelAfterDeleteSuccess().Bind(&hook.Handler[*ModelEvent]{
  		Id: "__pbFilesManagerDelete__",
  		Func: func(e *ModelEvent) error {
@@ -524,7 +520,7 @@ index 3d0f41c..5dcd8dd 100644
  				// ensure that there is a trailing slash so that the list iterator could start walking from the prefix dir
  				// (https://github.com/pocketbase/pocketbase/discussions/5246#discussioncomment-10128955)
  				prefix := strings.TrimRight(m.BaseFilesPath(), "/") + "/"
-@@ -1593,6 +1618,13 @@ func (app *BaseApp) initLogger() error {
+@@ -1593,6 +1614,13 @@ func (app *BaseApp) initLogger() error {
  		Priority: -999,
  	})
  
@@ -1708,10 +1704,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..9ae2b88
+index 0000000..abeea22
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,966 @@
+@@ -0,0 +1,992 @@
 +package core
 +
 +import (
@@ -2629,12 +2625,38 @@ index 0000000..9ae2b88
 +
 +	var purged int
 +
-+	for _, record := range records {
-+		if err := app.PurgeRecord(record); err != nil {
-+			return purged, err
++	// the rows are deleted by id, so a record restored between the select
++	// above and the delete below would be removed while it is live again.
++	// Every candidate is therefore re-read inside the transaction that
++	// deletes it and skipped unless it is still trashed and still older than
++	// the cutoff.
++	err = app.RunInTransaction(func(txApp App) error {
++		purged = 0
++
++		for _, record := range records {
++			current, err := txApp.FindTrashedRecordById(collection, record.Id)
++			if err != nil {
++				if errors.Is(err, sql.ErrNoRows) {
++					continue // restored in the meantime, or already gone
++				}
++				return err
++			}
++
++			if !before.IsZero() && !current.TrashedAt().Before(before) {
++				continue // trashed again after the cutoff
++			}
++
++			if err := txApp.PurgeRecord(current); err != nil {
++				return err
++			}
++
++			purged++
 +		}
 +
-+		purged++
++		return nil
++	})
++	if err != nil {
++		return 0, err
 +	}
 +
 +	return purged, nil
