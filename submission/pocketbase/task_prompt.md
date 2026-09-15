@@ -10,7 +10,7 @@ With `softDelete` enabled, unique indexes exclude trashed rows while keeping ind
 
 Cascade-delete dependents are trashed recursively. Trashing does not alter stored relation values, regardless of whether the relation cascades, so restoring the target makes its prior matches visible again. A multi-value relation follows only if the trashed record was its last visible target. Trashed records from a single delete share a timestamp and separate deletes never share one; `App.RestoreRecord` gathers that group from the record it is given and restores all of it, whatever order its members depend on each other in. Restoring an untrashed record does nothing, restoring without `softDelete` errors, and only a cascade dependency left trashed outside that group blocks a restore. The restored record comes back live in place, ready to change and save.
 
-`App.PurgeTrashedRecords` clears records trashed before a `types.DateTime` cutoff (zero value purges all) and reports how many went; a collection without `softDelete` errors. `App.PurgeExpiredTrashedRecords` applies collection retentions, skipping those without one.
+`App.PurgeTrashedRecords` clears records trashed before a `types.DateTime` cutoff (zero value purges all) and reports how many went; a collection without `softDelete` errors. `App.PurgeExpiredTrashedRecords` applies collection retentions, skipping those without one, and returns an error alone.
 
 List and view accept `trashed=with` for live and trashed records, or `trashed=only` for trashed records. Any other value returns 400; on collections without `softDelete`, ignore the parameter. The batch endpoint supports restore actions.
 
