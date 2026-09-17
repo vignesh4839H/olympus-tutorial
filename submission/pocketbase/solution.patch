@@ -879,7 +879,7 @@ index 93967c5..149a9ba 100644
  				errs[strconv.Itoa(i)] = validation.NewError(
  					"validation_invalid_index_expression",
 diff --git a/core/collection_validate.go b/core/collection_validate.go
-index a63b503..9976e3d 100644
+index a63b503..bb7a1d7 100644
 --- a/core/collection_validate.go
 +++ b/core/collection_validate.go
 @@ -325,6 +325,18 @@ func (cv *collectionValidator) checkViewQuery(value any) error {
@@ -901,7 +901,7 @@ index a63b503..9976e3d 100644
  	return nil
  }
  
-@@ -422,6 +434,56 @@ func (cv *collectionValidator) checkMinFields(value any) error {
+@@ -422,6 +434,60 @@ func (cv *collectionValidator) checkMinFields(value any) error {
  	return nil
  }
  
@@ -918,7 +918,11 @@ index a63b503..9976e3d 100644
 +		return nil
 +	}
 +
-+	if validator.original.SoftDelete {
++	// the persisted state decides, not the submitted "original": an import
++	// saves the collection before it validates it and then hands the imported
++	// object in as its own original, which would report the mode as already
++	// on and skip the conflict check entirely
++	if validator.new.previousSoftDelete {
 +		return nil // already on, so the field is the one this mode created
 +	}
 +
@@ -958,7 +962,7 @@ index a63b503..9976e3d 100644
  func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) error {
  	fields, ok := value.(FieldsList)
  	if !ok {
-@@ -437,6 +499,13 @@ func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) erro
+@@ -437,6 +503,13 @@ func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) erro
  			continue
  		}
  
@@ -972,7 +976,7 @@ index a63b503..9976e3d 100644
  		newField := fields.GetById(oldField.GetId())
  
  		if newField == nil || oldField.GetName() != newField.GetName() {
-@@ -692,6 +761,8 @@ func (validator *collectionValidator) validateOptions() error {
+@@ -692,6 +765,8 @@ func (validator *collectionValidator) validateOptions() error {
  		return validator.new.collectionAuthOptions.validate(validator)
  	case CollectionTypeView:
  		return validator.new.collectionViewOptions.validate(validator)
@@ -1347,7 +1351,7 @@ index fa65893..08abbbc 100644
  		}
  
 diff --git a/core/record_model.go b/core/record_model.go
-index b654864..ce4391d 100644
+index b654864..a900813 100644
 --- a/core/record_model.go
 +++ b/core/record_model.go
 @@ -50,6 +50,10 @@ type Record struct {
@@ -1365,7 +1369,7 @@ index b654864..ce4391d 100644
  }
  
  func onRecordValidate(e *RecordEvent) error {
-+	if err := checkTrashedRecordUpdate(e.Context, e.Record); err != nil {
++	if err := checkTrashedRecordUpdate(e.App, e.Context, e.Record); err != nil {
 +		return err
 +	}
 +
@@ -1718,10 +1722,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..abeea22
+index 0000000..4d48421
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,992 @@
+@@ -0,0 +1,1016 @@
 +package core
 +
 +import (
@@ -2037,25 +2041,30 @@ index 0000000..abeea22
 +
 +	// every record trashed as part of this delete shares the same timestamp
 +	// so that a later restore can bring back exactly the same group
-+	trashedAt, ok := trashTimestampFromContext(e.Context)
-+	if !ok {
-+		trashedAt, err = nextTrashTimestamp(e.App)
-+		if err != nil {
-+			return false, err
-+		}
-+	}
-+
-+	ctx := withTrashTimestamp(e.Context, trashedAt)
-+
 +	originalApp := e.App
 +	txErr := e.App.RunInTransaction(func(txApp App) error {
 +		e.App = txApp
++
++		// the stamp is picked inside the write transaction, so the scan for a
++		// free one and the row it is written to are serialized with every
++		// other writer on this database - including one in another process
++		// pointed at the same pb_data, which a process-local marker alone
++		// cannot see
++		trashedAt, ok := trashTimestampFromContext(e.Context)
++		if !ok {
++			var err error
++
++			trashedAt, err = nextTrashTimestamp(txApp)
++			if err != nil {
++				return err
++			}
++		}
 +
 +		if err := trashRecordExecute(e, trashedAt); err != nil {
 +			return err
 +		}
 +
-+		return cascadeRecordTrash(txApp, ctx, e.Record, refs)
++		return cascadeRecordTrash(txApp, withTrashTimestamp(e.Context, trashedAt), e.Record, refs)
 +	})
 +	e.App = originalApp
 +
@@ -2427,17 +2436,36 @@ index 0000000..abeea22
 +// The decision is made from the operation, not from the submitted value:
 +// letting any save that happens to clear the trash stamp through would turn
 +// an ordinary update into a second, unchecked restore path.
-+func checkTrashedRecordUpdate(ctx context.Context, record *Record) error {
++func checkTrashedRecordUpdate(app App, ctx context.Context, record *Record) error {
 +	if record.IsNew() || !record.Collection().IsSoftDeleteEnabled() {
 +		return nil
 +	}
 +
-+	if record.Original().GetDateTime(FieldNameDeleted).IsZero() {
-+		return nil // the persisted record is not trashed
-+	}
-+
 +	if IsRestoreOperation(ctx) {
 +		return nil
++	}
++
++	// the decision is made against the row rather than the caller's snapshot:
++	// an instance loaded before another one trashed the same record still
++	// carries an empty stamp, and the update writes the whole record, so
++	// trusting the snapshot would let an ordinary save resurrect the row
++	var deleted string
++
++	err := app.ConcurrentDB().
++		Select("[[" + FieldNameDeleted + "]]").
++		From(record.Collection().Name).
++		AndWhere(dbx.HashExp{idColumn: record.LastSavedPK()}).
++		Limit(1).
++		Row(&deleted)
++	if err != nil {
++		if errors.Is(err, sql.ErrNoRows) {
++			return nil // the row is gone; the update reports that on its own
++		}
++		return err
++	}
++
++	if deleted == "" {
++		return nil // the persisted record is not trashed
 +	}
 +
 +	return validation.Errors{
