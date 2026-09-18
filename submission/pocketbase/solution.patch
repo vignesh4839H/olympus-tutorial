@@ -1761,10 +1761,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..4d48421
+index 0000000..6964850
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,1016 @@
+@@ -0,0 +1,1039 @@
 +package core
 +
 +import (
@@ -1972,27 +1972,15 @@ index 0000000..4d48421
 +		return "", nil
 +	}
 +
-+	parser := new(identifiersParser)
-+	if err := parser.parse(selectQuery); err != nil {
-+		return "", nil // an unparsable query is reported by the query validation itself
++	collections, err := app.FindAllCollections(CollectionTypeBase)
++	if err != nil {
++		return "", err
 +	}
 +
-+	// the sources are resolved one by one rather than through
-+	// findCollectionsByIdentifiers, which matches the parsed identifier
-+	// against the stored name exactly. SQLite resolves table names without
-+	// regard to case and so does every other collection lookup here, so a
-+	// view selecting from "Posts" reads the "posts" rows and has to be seen
-+	// as reading them.
-+	names := make([]string, 0, len(parser.tables))
-+
-+	for _, table := range parser.tables {
-+		source, err := findViewSourceCollection(app, table)
-+		if err != nil {
-+			return "", err
-+		}
-+
-+		if source != nil && source.IsSoftDeleteEnabled() {
-+			names = append(names, source.Name)
++	names := make([]string, 0, len(collections))
++	for _, collection := range collections {
++		if collection.IsSoftDeleteEnabled() {
++			names = append(names, collection.Name)
 +		}
 +	}
 +
@@ -2000,32 +1988,16 @@ index 0000000..4d48421
 +		return "", nil
 +	}
 +
-+	// the identifier order is not meaningful, so the reported name is the
-+	// first in a stable one
++	// the reported name is the first in a stable order
 +	sort.Strings(names)
 +
-+	return names[0], nil
-+}
-+
-+// findViewSourceCollection resolves a table identifier of a view query to the
-+// collection it reads, ignoring the identifier case the way SQLite does.
-+//
-+// A missing collection is not an error here: the identifier can name a CTE, a
-+// subquery or a plain table, none of which hold records.
-+func findViewSourceCollection(app App, table identifier) (*Collection, error) {
-+	if strings.Contains(table.alias, "(") {
-+		return nil, nil // an expression rather than a table
-+	}
-+
-+	collection, err := app.FindCachedCollectionByNameOrId(table.original)
-+	if err != nil {
-+		if errors.Is(err, sql.ErrNoRows) {
-+			return nil, nil
++	for _, name := range names {
++		if queryMentionsCollection(selectQuery, name) {
++			return name, nil
 +		}
-+		return nil, err
 +	}
 +
-+	return collection, nil
++	return "", nil
 +}
 +
 +// softDeleteViewDependant returns the name of an existing view that reads the
@@ -2037,20 +2009,71 @@ index 0000000..4d48421
 +	}
 +
 +	for _, view := range views {
-+		parser := new(identifiersParser)
-+		if err := parser.parse(view.ViewQuery); err != nil {
-+			continue
-+		}
-+
-+		for _, table := range parser.tables {
-+			// matched without regard to case for the same reason as above
-+			if strings.EqualFold(table.original, collection.Name) {
-+				return view.Name, nil
-+			}
++		if queryMentionsCollection(view.ViewQuery, collection.Name) {
++			return view.Name, nil
 +		}
 +	}
 +
 +	return "", nil
++}
++
++// queryMentionsCollection reports whether the raw view SQL names the
++// collection anywhere, as a whole word and without regard to case.
++//
++// The check reads the query text rather than its parsed sources on purpose.
++// The identifier parser splits on commas and whitespace alone, so a CTE or a
++// subquery hands it a token like "posts)" and the source goes unnoticed - and
++// a view that slips through is read without the trash predicate, because the
++// predicate hangs off the queried collection having the mode rather than off
++// the tables underneath. Reading the text refuses more than it strictly has
++// to, which is the safe direction for a rule whose failure is exposing
++// trashed rows.
++func queryMentionsCollection(query string, name string) bool {
++	if query == "" || name == "" {
++		return false
++	}
++
++	haystack := strings.ToLower(query)
++	needle := strings.ToLower(name)
++
++	for offset := 0; offset <= len(haystack)-len(needle); {
++		i := strings.Index(haystack[offset:], needle)
++		if i < 0 {
++			return false
++		}
++
++		start := offset + i
++		end := start + len(needle)
++
++		if !isIdentifierByte(byteBefore(haystack, start)) && !isIdentifierByte(byteAfter(haystack, end)) {
++			return true
++		}
++
++		offset = start + 1
++	}
++
++	return false
++}
++
++func isIdentifierByte(b byte) bool {
++	return b == '_' ||
++		(b >= 'a' && b <= 'z') ||
++		(b >= 'A' && b <= 'Z') ||
++		(b >= '0' && b <= '9')
++}
++
++func byteBefore(s string, i int) byte {
++	if i <= 0 {
++		return 0
++	}
++	return s[i-1]
++}
++
++func byteAfter(s string, i int) byte {
++	if i >= len(s) {
++		return 0
++	}
++	return s[i]
 +}
 +
 +// notTrashedExpr returns the expression matching only the records of the
