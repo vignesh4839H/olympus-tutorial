@@ -551,7 +551,7 @@ index e169a55..60c8e3e 100644
  				return fmt.Errorf("failed to save collection %q: %w", imported.Name, err)
  			}
 diff --git a/core/collection_model.go b/core/collection_model.go
-index 2ed040a..1dcebf7 100644
+index 2ed040a..e867a22 100644
 --- a/core/collection_model.go
 +++ b/core/collection_model.go
 @@ -355,6 +355,22 @@ type baseCollection struct {
@@ -672,7 +672,7 @@ index 2ed040a..1dcebf7 100644
  	case CollectionTypeAuth:
  		c.initIdField()
  		c.initPasswordField()
-@@ -983,6 +1043,148 @@ func (c *Collection) initIdField() {
+@@ -983,6 +1043,180 @@ func (c *Collection) initIdField() {
  	}
  }
  
@@ -767,15 +767,47 @@ index 2ed040a..1dcebf7 100644
 +	existing := c.GetIndex(indexName)
 +
 +	if !c.SoftDelete {
-+		if c.previousSoftDelete && isSoftDeleteFieldIndex(existing) {
-+			c.RemoveIndex(indexName)
++		if c.previousSoftDelete {
++			if isSoftDeleteFieldIndex(existing) {
++				c.RemoveIndex(indexName)
++			}
++
++			// the column goes with the field, so every index standing on it
++			// goes too. Leaving one behind would have the table sync drop the
++			// column and then try to recreate that definition against a
++			// column that is no longer there, which fails the whole toggle
++			for _, raw := range c.Indexes {
++				if indexUsesDeletedField(raw) {
++					if parsed := dbutils.ParseIndex(raw); parsed.IndexName != "" {
++						c.RemoveIndex(parsed.IndexName)
++					}
++				}
++			}
 +		}
++
 +		return
 +	}
 +
 +	if existing == "" {
 +		c.AddIndex(indexName, false, "`"+FieldNameDeleted+"`", "")
 +	}
++}
++
++// indexUsesDeletedField reports whether the index definition stands on the
++// column this mode generates, whichever collection defined it.
++func indexUsesDeletedField(raw string) bool {
++	parsed := dbutils.ParseIndex(raw)
++	if !parsed.IsValid() {
++		return false
++	}
++
++	for _, column := range parsed.Columns {
++		if strings.EqualFold(column.Name, FieldNameDeleted) {
++			return true
++		}
++	}
++
++	return strings.Contains(strings.ToLower(parsed.Where), strings.ToLower(FieldNameDeleted))
 +}
 +
 +// isSoftDeleteFieldIndex reports whether the expression is the plain single
