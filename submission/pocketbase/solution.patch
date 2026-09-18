@@ -534,8 +534,24 @@ index 3d0f41c..b112abc 100644
  	// cleanup old logs
  	app.Cron().Add("__pbLogsCleanup__", "0 */6 * * *", func() {
  		deleteErr := app.DeleteOldLogs(time.Now().AddDate(0, 0, -1*app.Settings().Logs.MaxDays))
+diff --git a/core/collection_import.go b/core/collection_import.go
+index e169a55..60c8e3e 100644
+--- a/core/collection_import.go
++++ b/core/collection_import.go
+@@ -167,6 +167,11 @@ func (app *BaseApp) ImportCollections(toImport []map[string]any, deleteMissing b
+ 
+ 		// upsert imported collections
+ 		for _, imported := range importedCollections {
++			// an enabled collection serializes its generated "deleted" field
++			// along with the option, so an import is allowed to bring that
++			// field back rather than colliding with it
++			imported.adoptGeneratedDeletedField()
++
+ 			if err := txApp.SaveNoValidate(imported); err != nil {
+ 				return fmt.Errorf("failed to save collection %q: %w", imported.Name, err)
+ 			}
 diff --git a/core/collection_model.go b/core/collection_model.go
-index 2ed040a..ce9c91b 100644
+index 2ed040a..1dcebf7 100644
 --- a/core/collection_model.go
 +++ b/core/collection_model.go
 @@ -355,6 +355,22 @@ type baseCollection struct {
@@ -624,7 +640,7 @@ index 2ed040a..ce9c91b 100644
  	}
  
  	return result, nil
-@@ -814,6 +856,37 @@ func onCollectionSave(e *CollectionEvent) error {
+@@ -814,6 +856,22 @@ func onCollectionSave(e *CollectionEvent) error {
  	// like default field id are applied
  	e.Collection.Fields = NewFieldsList(e.Collection.Fields...)
  
@@ -632,37 +648,22 @@ index 2ed040a..ce9c91b 100644
 +	// otherwise the field this mode adds is indistinguishable from one the
 +	// collection defined itself
 +	if e.Collection.IsBase() {
-+		submitted := e.Collection.Fields.GetByName(FieldNameDeleted)
-+
++		e.Collection.ownDeletedField = e.Collection.Fields.GetByName(FieldNameDeleted) != nil &&
++			!e.Collection.generatedDeletedField
 +		e.Collection.previousSoftDelete = false
-+		persistedOwnField := false
 +
 +		if !e.Collection.IsNew() {
 +			persisted := &Collection{}
 +			if err := e.App.ModelQuery(persisted).Model(e.Collection.LastSavedPK(), persisted); err == nil {
 +				e.Collection.previousSoftDelete = persisted.SoftDelete
-+				persistedOwnField = persisted.Fields.GetByName(FieldNameDeleted) != nil
 +			}
 +		}
-+
-+		// a serialized enabled collection carries this mode's own field, so a
-+		// representation that brings the option and the generated shape in
-+		// together - an import, or a collection recreated from its own JSON -
-+		// adopts the field instead of colliding with it. What makes the name
-+		// the collection's own is the stored row having it first
-+		if submitted != nil && e.Collection.SoftDelete && !persistedOwnField {
-+			if field, ok := submitted.(*DateField); ok && field.System {
-+				e.Collection.generatedDeletedField = true
-+			}
-+		}
-+
-+		e.Collection.ownDeletedField = submitted != nil && !e.Collection.generatedDeletedField
 +	}
 +
  	e.Collection.initDefaultFields()
  
  	if e.Collection.IsAuth() {
-@@ -942,6 +1015,8 @@ func (c *Collection) initDefaultFields() {
+@@ -942,6 +1000,8 @@ func (c *Collection) initDefaultFields() {
  	switch c.Type {
  	case CollectionTypeBase:
  		c.initIdField()
@@ -671,10 +672,29 @@ index 2ed040a..ce9c91b 100644
  	case CollectionTypeAuth:
  		c.initIdField()
  		c.initPasswordField()
-@@ -983,6 +1058,129 @@ func (c *Collection) initIdField() {
+@@ -983,6 +1043,148 @@ func (c *Collection) initIdField() {
  	}
  }
  
++// adoptGeneratedDeletedField marks a submitted "deleted" field as this mode's
++// own, so that a later save does not read it as a name the collection claimed
++// for itself.
++//
++// It exists for the import path alone. A serialized enabled collection carries
++// both the option and the generated field, so restoring one has to be able to
++// bring that field back, while a caller going through the ordinary save path
++// never reaches here and still gets the name refused. Only this mode's own
++// shape is adopted; any other field of that name keeps conflicting.
++func (c *Collection) adoptGeneratedDeletedField() {
++	if !c.IsBase() || !c.SoftDelete {
++		return
++	}
++
++	if field, ok := c.Fields.GetByName(FieldNameDeleted).(*DateField); ok && field.System {
++		c.generatedDeletedField = true
++	}
++}
++
 +// initDeletedField initializes (or removes) the "deleted" system field
 +// that stores the timestamp at which a record was moved to the trash.
 +//
