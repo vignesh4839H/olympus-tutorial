@@ -535,7 +535,7 @@ index 3d0f41c..b112abc 100644
  	app.Cron().Add("__pbLogsCleanup__", "0 */6 * * *", func() {
  		deleteErr := app.DeleteOldLogs(time.Now().AddDate(0, 0, -1*app.Settings().Logs.MaxDays))
 diff --git a/core/collection_model.go b/core/collection_model.go
-index 2ed040a..ca56fc1 100644
+index 2ed040a..ce9c91b 100644
 --- a/core/collection_model.go
 +++ b/core/collection_model.go
 @@ -355,6 +355,22 @@ type baseCollection struct {
@@ -624,7 +624,7 @@ index 2ed040a..ca56fc1 100644
  	}
  
  	return result, nil
-@@ -814,6 +856,22 @@ func onCollectionSave(e *CollectionEvent) error {
+@@ -814,6 +856,37 @@ func onCollectionSave(e *CollectionEvent) error {
  	// like default field id are applied
  	e.Collection.Fields = NewFieldsList(e.Collection.Fields...)
  
@@ -632,22 +632,37 @@ index 2ed040a..ca56fc1 100644
 +	// otherwise the field this mode adds is indistinguishable from one the
 +	// collection defined itself
 +	if e.Collection.IsBase() {
-+		e.Collection.ownDeletedField = e.Collection.Fields.GetByName(FieldNameDeleted) != nil &&
-+			!e.Collection.generatedDeletedField
++		submitted := e.Collection.Fields.GetByName(FieldNameDeleted)
++
 +		e.Collection.previousSoftDelete = false
++		persistedOwnField := false
 +
 +		if !e.Collection.IsNew() {
 +			persisted := &Collection{}
 +			if err := e.App.ModelQuery(persisted).Model(e.Collection.LastSavedPK(), persisted); err == nil {
 +				e.Collection.previousSoftDelete = persisted.SoftDelete
++				persistedOwnField = persisted.Fields.GetByName(FieldNameDeleted) != nil
 +			}
 +		}
++
++		// a serialized enabled collection carries this mode's own field, so a
++		// representation that brings the option and the generated shape in
++		// together - an import, or a collection recreated from its own JSON -
++		// adopts the field instead of colliding with it. What makes the name
++		// the collection's own is the stored row having it first
++		if submitted != nil && e.Collection.SoftDelete && !persistedOwnField {
++			if field, ok := submitted.(*DateField); ok && field.System {
++				e.Collection.generatedDeletedField = true
++			}
++		}
++
++		e.Collection.ownDeletedField = submitted != nil && !e.Collection.generatedDeletedField
 +	}
 +
  	e.Collection.initDefaultFields()
  
  	if e.Collection.IsAuth() {
-@@ -942,6 +1000,8 @@ func (c *Collection) initDefaultFields() {
+@@ -942,6 +1015,8 @@ func (c *Collection) initDefaultFields() {
  	switch c.Type {
  	case CollectionTypeBase:
  		c.initIdField()
@@ -656,7 +671,7 @@ index 2ed040a..ca56fc1 100644
  	case CollectionTypeAuth:
  		c.initIdField()
  		c.initPasswordField()
-@@ -983,6 +1043,128 @@ func (c *Collection) initIdField() {
+@@ -983,6 +1058,129 @@ func (c *Collection) initIdField() {
  	}
  }
  
@@ -683,9 +698,10 @@ index 2ed040a..ca56fc1 100644
 +		return
 +	}
 +
-+	if c.previousSoftDelete {
-+		// the mode was already on, so the name belongs to it and the generated
-+		// field has to be put back whatever the submitted fields did with it
++	if c.previousSoftDelete || c.generatedDeletedField {
++		// the name belongs to this mode - either it was already on, or the
++		// submitted field is its own generated shape - so the field is put
++		// back whatever the submitted schema did with it
 +		if field, ok := existing.(*DateField); ok {
 +			field.System = true
 +			field.Hidden = false
