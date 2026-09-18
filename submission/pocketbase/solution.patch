@@ -535,7 +535,7 @@ index 3d0f41c..b112abc 100644
  	app.Cron().Add("__pbLogsCleanup__", "0 */6 * * *", func() {
  		deleteErr := app.DeleteOldLogs(time.Now().AddDate(0, 0, -1*app.Settings().Logs.MaxDays))
 diff --git a/core/collection_model.go b/core/collection_model.go
-index 2ed040a..fc5b3b7 100644
+index 2ed040a..ca56fc1 100644
 --- a/core/collection_model.go
 +++ b/core/collection_model.go
 @@ -355,6 +355,22 @@ type baseCollection struct {
@@ -656,7 +656,7 @@ index 2ed040a..fc5b3b7 100644
  	case CollectionTypeAuth:
  		c.initIdField()
  		c.initPasswordField()
-@@ -983,6 +1043,125 @@ func (c *Collection) initIdField() {
+@@ -983,6 +1043,128 @@ func (c *Collection) initIdField() {
  	}
  }
  
@@ -669,12 +669,15 @@ index 2ed040a..fc5b3b7 100644
 +	existing := c.Fields.GetByName(FieldNameDeleted)
 +
 +	if !c.SoftDelete {
-+		// only the field this mode added is this mode's to take away
-+		if c.previousSoftDelete {
-+			if field, ok := existing.(*DateField); ok && field.System {
-+				c.Fields.RemoveByName(FieldNameDeleted)
-+				c.generatedDeletedField = false
-+			}
++		// the persisted state is what makes the field this mode's to take
++		// away: while the mode was on the name belonged to it, so the field
++		// goes whatever the submitted schema did to its type or system flag.
++		// Keying the removal off the submitted shape instead would let an
++		// update that clears the flag in the same save leave the field and
++		// its column behind
++		if c.previousSoftDelete && existing != nil {
++			c.Fields.RemoveByName(FieldNameDeleted)
++			c.generatedDeletedField = false
 +		}
 +
 +		return
