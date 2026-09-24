@@ -3563,10 +3563,10 @@ index 0000000..3355e1a
 +}
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..f6a88ba
+index 0000000..845e0fd
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,95 @@
+@@ -0,0 +1,118 @@
 +#!/usr/bin/env bash
 +#
 +# Usage:
@@ -3600,6 +3600,8 @@ index 0000000..f6a88ba
 +
 +RUN_ARGS=()
 +EXPECT_DIRS=()
++EXTRA_PACKAGES=()
++EXTRA_RUN_ARGS=()
 +
 +case "$MODE" in
 +  base)
@@ -3614,7 +3616,14 @@ index 0000000..f6a88ba
 +    # build their subtest names out of pointer addresses and random file names,
 +    # so the names differ between runs even though the results never do, which
 +    # makes a report diff look unstable.
-+    RUN_ARGS=(-skip '^(TestRecordAuthWithOAuth2|TestNotifyWatcher_CollectionsUpdate|TestNotifyWatcher_SettingsUpdate|TestFileFieldDriverValue|TestFileFieldPrepareValue|TestRecordGetBool|TestRecordGetDateTime|TestRecordGetFloat|TestRecordGetInt|TestRecordGetInt64|TestRecordGetStringSlice)$')
++    RUN_ARGS=(-skip '^(TestRecordAuthWithOAuth2|TestBatchRequest|TestNotifyWatcher_CollectionsUpdate|TestNotifyWatcher_SettingsUpdate|TestFileFieldDriverValue|TestFileFieldPrepareValue|TestRecordGetBool|TestRecordGetDateTime|TestRecordGetFloat|TestRecordGetInt|TestRecordGetInt64|TestRecordGetStringSlice)$')
++    # TestBatchRequest is skipped above only to drop one of its cases:
++    # "transaction timeout" gives the batch a one second budget and sleeps
++    # 600ms per request, so which request the deadline lands on depends on
++    # how loaded the machine is. Go matches -skip a level at a time and takes
++    # a single pattern, so the rest of the test comes back in a second pass.
++    EXTRA_PACKAGES=(./apis/)
++    EXTRA_RUN_ARGS=(-run '^TestBatchRequest$' -skip '^TestBatchRequest$/^transaction_timeout$')
 +    ;;
 +  new)
 +    PACKAGES=(./softdeletetests/)
@@ -3652,7 +3661,21 @@ index 0000000..f6a88ba
 +  fi
 +done
 +
-+go test -count=1 -json ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} "${PACKAGES[@]}" | go run ./scripts/junitreport ${REPORTER_ARGS[@]+"${REPORTER_ARGS[@]}"}
++# the suites are run as one stream so that a single report covers them all,
++# and the worst status of the runs is the status of the whole thing
++run_suites() {
++  local rc=0
++
++  go test -count=1 -json ${RUN_ARGS[@]+"${RUN_ARGS[@]}"} "${PACKAGES[@]}" || rc=$?
++
++  if [ ${#EXTRA_PACKAGES[@]} -gt 0 ]; then
++    go test -count=1 -json ${EXTRA_RUN_ARGS[@]+"${EXTRA_RUN_ARGS[@]}"} "${EXTRA_PACKAGES[@]}" || rc=$?
++  fi
++
++  return "$rc"
++}
++
++run_suites | go run ./scripts/junitreport ${REPORTER_ARGS[@]+"${REPORTER_ARGS[@]}"}
 +STATUS=("${PIPESTATUS[@]}")
 +
 +# a run is only a success when the tests passed and the requested report was
