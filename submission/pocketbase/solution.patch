@@ -551,7 +551,7 @@ index e169a55..60c8e3e 100644
  				return fmt.Errorf("failed to save collection %q: %w", imported.Name, err)
  			}
 diff --git a/core/collection_model.go b/core/collection_model.go
-index 2ed040a..0cd0912 100644
+index 2ed040a..f00dd2b 100644
 --- a/core/collection_model.go
 +++ b/core/collection_model.go
 @@ -3,6 +3,7 @@ package core
@@ -680,7 +680,7 @@ index 2ed040a..0cd0912 100644
  	case CollectionTypeAuth:
  		c.initIdField()
  		c.initPasswordField()
-@@ -983,6 +1044,184 @@ func (c *Collection) initIdField() {
+@@ -983,6 +1044,187 @@ func (c *Collection) initIdField() {
  	}
  }
  
@@ -712,15 +712,14 @@ index 2ed040a..0cd0912 100644
 +	existing := c.Fields.GetByName(FieldNameDeleted)
 +
 +	if !c.SoftDelete {
-+		// the persisted state is what makes the field this mode's to take
-+		// away: while the mode was on the name belonged to it, so the field
-+		// goes whatever the submitted schema did to its type or system flag.
-+		// Keying the removal off the submitted shape instead would let an
-+		// update that clears the flag in the same save leave the field and
-+		// its column behind
-+		if c.previousSoftDelete && existing != nil {
++		// the field is this mode's to take away when the persisted state says
++		// the name belonged to it, or when this very instance injected it.
++		// The second half matters for a retry: an enable refused by
++		// validation never reaches the database, so the persisted state
++		// still reads disabled while the field it added is sitting on the
++		// model, and a corrected save would carry it through
++		if (c.previousSoftDelete || c.generatedDeletedField) && existing != nil {
 +			c.Fields.RemoveByName(FieldNameDeleted)
-+			c.generatedDeletedField = false
 +		}
 +
 +		return
@@ -775,7 +774,9 @@ index 2ed040a..0cd0912 100644
 +	existing := c.GetIndex(indexName)
 +
 +	if !c.SoftDelete {
-+		if c.previousSoftDelete {
++		// same ownership as the field itself, so an index left behind by a
++		// refused enable goes with it
++		if c.previousSoftDelete || c.generatedDeletedField {
 +			if isSoftDeleteFieldIndex(existing) {
 +				c.RemoveIndex(indexName)
 +			}
@@ -792,6 +793,8 @@ index 2ed040a..0cd0912 100644
 +					}
 +				}
 +			}
++
++			c.generatedDeletedField = false
 +		}
 +
 +		return
