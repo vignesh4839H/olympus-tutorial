@@ -1028,10 +1028,10 @@ index 0000000..2e665b4
 +}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..46e2da2
+index 0000000..07b0d02
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,2158 @@
+@@ -0,0 +1,2266 @@
 +package softdeletetests
 +
 +import (
@@ -3188,6 +3188,114 @@ index 0000000..46e2da2
 +
 +	if _, err := app.FindRecordById(comments, comment.Id); !errors.Is(err, sql.ErrNoRows) {
 +		t.Fatalf("expected the separately trashed comment to stay in the trash, got %v", err)
++	}
++}
++
++func TestSoftDeletePurgeTrashedRecordsCutoffIsStrict(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	atCutoff := sdNewRecord(t, app, posts, map[string]any{"title": "exactly at the cutoff"})
++	before := sdNewRecord(t, app, posts, map[string]any{"title": "a moment earlier"})
++
++	for _, record := range []*core.Record{atCutoff, before} {
++		if err := app.Delete(record); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	cutoff := types.NowDateTime().Add(-1 * time.Hour)
++
++	stamp := func(record *core.Record, at types.DateTime) {
++		t.Helper()
++
++		_, err := app.DB().Update(
++			posts.Name,
++			dbx.Params{core.FieldNameDeleted: at.String()},
++			dbx.HashExp{"id": record.Id},
++		).Execute()
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	stamp(atCutoff, cutoff)
++	stamp(before, cutoff.Add(-1*time.Minute))
++
++	purged, err := app.PurgeTrashedRecords(posts, cutoff)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if purged != 1 {
++		t.Fatalf("expected only the earlier record to go, got %d", purged)
++	}
++
++	if sdRawExists(t, app, posts, before.Id) {
++		t.Fatal("expected the record trashed before the cutoff to be removed")
++	}
++
++	if !sdRawExists(t, app, posts, atCutoff.Id) {
++		t.Fatal("expected the record trashed exactly at the cutoff to be kept")
++	}
++}
++
++func TestSoftDeletePurgeExpiredUsesEachCollectionRetention(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	// one hour and one day, so a record older than an hour outlives only the
++	// first; the retentions are written as literals so that the test does not
++	// pin the field to a particular integer type
++	short := core.NewBaseCollection("sd_retention_short")
++	short.SoftDelete = true
++	short.TrashRetention = 3600
++	short.Fields.Add(&core.TextField{Name: "title"})
++	if err := app.Save(short); err != nil {
++		t.Fatal(err)
++	}
++
++	long := core.NewBaseCollection("sd_retention_long")
++	long.SoftDelete = true
++	long.TrashRetention = 86400
++	long.Fields.Add(&core.TextField{Name: "title"})
++	if err := app.Save(long); err != nil {
++		t.Fatal(err)
++	}
++
++	shortRecord := sdNewRecord(t, app, short, map[string]any{"title": "short"})
++	longRecord := sdNewRecord(t, app, long, map[string]any{"title": "long"})
++
++	for _, pair := range []struct {
++		collection *core.Collection
++		record     *core.Record
++	}{{short, shortRecord}, {long, longRecord}} {
++		if err := app.Delete(pair.record); err != nil {
++			t.Fatal(err)
++		}
++
++		_, err := app.DB().Update(
++			pair.collection.Name,
++			dbx.Params{core.FieldNameDeleted: types.NowDateTime().Add(-2 * time.Hour).String()},
++			dbx.HashExp{"id": pair.record.Id},
++		).Execute()
++		if err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	if err := app.PurgeExpiredTrashedRecords(); err != nil {
++		t.Fatal(err)
++	}
++
++	if sdRawExists(t, app, short, shortRecord.Id) {
++		t.Fatal("expected the record past the one hour retention to be removed")
++	}
++
++	if !sdRawExists(t, app, long, longRecord.Id) {
++		t.Fatal("expected the record still inside the one day retention to be kept")
 +	}
 +}
 diff --git a/test.sh b/test.sh
