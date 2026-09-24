@@ -551,7 +551,7 @@ index e169a55..60c8e3e 100644
  				return fmt.Errorf("failed to save collection %q: %w", imported.Name, err)
  			}
 diff --git a/core/collection_model.go b/core/collection_model.go
-index 2ed040a..ac37d25 100644
+index 2ed040a..0cd0912 100644
 --- a/core/collection_model.go
 +++ b/core/collection_model.go
 @@ -3,6 +3,7 @@ package core
@@ -680,7 +680,7 @@ index 2ed040a..ac37d25 100644
  	case CollectionTypeAuth:
  		c.initIdField()
  		c.initPasswordField()
-@@ -983,6 +1044,185 @@ func (c *Collection) initIdField() {
+@@ -983,6 +1044,184 @@ func (c *Collection) initIdField() {
  	}
  }
  
@@ -784,7 +784,6 @@ index 2ed040a..ac37d25 100644
 +			// goes too. Leaving one behind would have the table sync drop the
 +			// column and then try to recreate that definition against a
 +			// column that is no longer there, which fails the whole toggle
-+			// RemoveIndex rewrites c.Indexes, so walk a copy of it
 +			// RemoveIndex rewrites c.Indexes, so walk a copy of it
 +			for _, raw := range slices.Clone(c.Indexes) {
 +				if indexUsesDeletedField(raw) {
