@@ -329,10 +329,10 @@ index 0000000..5623cef
 +}
 diff --git a/softdeletetests/api_soft_delete_280aff_test.go b/softdeletetests/api_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..eec85cc
+index 0000000..fa0b0d3
 --- /dev/null
 +++ b/softdeletetests/api_soft_delete_280aff_test.go
-@@ -0,0 +1,602 @@
+@@ -0,0 +1,634 @@
 +package softdeletetests
 +
 +import (
@@ -935,12 +935,44 @@ index 0000000..eec85cc
 +		scenario.Test(t)
 +	}
 +}
++
++func TestSoftDeleteRecordViewApiWithModeOnLiveRecords(t *testing.T) {
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "a live record is still viewable with trashed=with",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId + "?trashed=with",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdLiveRecordId + `"`,
++				`"deleted":""`,
++			},
++		},
++		{
++			Name:           "trashed=with lists both through the list route",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records?trashed=with&sort=title",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"totalItems":2`,
++				`"id":"` + sdLiveRecordId + `"`,
++				`"id":"` + sdTrashedRecordId + `"`,
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..d6122e0
+index 0000000..46e2da2
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,2069 @@
+@@ -0,0 +1,2158 @@
 +package softdeletetests
 +
 +import (
@@ -3008,6 +3040,95 @@ index 0000000..d6122e0
 +		if sdRawExists(t, app, pair.collection, pair.id) {
 +			t.Fatalf("expected the %s row to be gone, it is still there", pair.label)
 +		}
++	}
++}
++
++func TestSoftDeleteSerializedOptionGoesWithTheMode(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	collection := core.NewBaseCollection("sd_option_roundtrip")
++	collection.Fields.Add(&core.TextField{Name: "title"})
++	collection.SoftDelete = true
++	collection.TrashRetention = 60
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	raw, err := collection.MarshalJSON()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if !strings.Contains(string(raw), `"softDelete":true`) {
++		t.Fatalf("expected the option while enabled in\n%s", raw)
++	}
++
++	collection.SoftDelete = false
++	collection.TrashRetention = 0
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	raw, err = collection.MarshalJSON()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if strings.Contains(string(raw), "softDelete") || strings.Contains(string(raw), "trashRetention") {
++		t.Fatalf("expected the options to go with the mode, got\n%s", raw)
++	}
++
++	reloaded, err := app.FindCollectionByNameOrId("sd_option_roundtrip")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	raw, err = reloaded.MarshalJSON()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if strings.Contains(string(raw), "softDelete") {
++		t.Fatalf("expected a reloaded disabled collection to serialize as before, got\n%s", raw)
++	}
++}
++
++func TestSoftDeleteTrashedReferrersDoNotBlockRestore(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "target"})
++	comment := sdNewRecord(t, app, comments, map[string]any{"message": "child", "post": post.Id})
++
++	// the comment goes first and on its own, so it lands in its own group
++	if err := app.Delete(comment); err != nil {
++		t.Fatal(err)
++	}
++
++	// ... and the post follows separately
++	if err := app.Delete(post); err != nil {
++		t.Fatal(err)
++	}
++
++	trashedPost, err := app.FindTrashedRecordById(posts, post.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// the trashed comment points at the post, which must not hold it back
++	if err := app.RestoreRecord(trashedPost); err != nil {
++		t.Fatalf("expected a record pointing at the target not to block its restore, got %v", err)
++	}
++
++	if _, err := app.FindRecordById(posts, post.Id); err != nil {
++		t.Fatalf("expected the post to be live again, got %v", err)
++	}
++
++	if _, err := app.FindRecordById(comments, comment.Id); !errors.Is(err, sql.ErrNoRows) {
++		t.Fatalf("expected the separately trashed comment to stay in the trash, got %v", err)
 +	}
 +}
 diff --git a/test.sh b/test.sh
