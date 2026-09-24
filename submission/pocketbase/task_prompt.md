@@ -8,7 +8,7 @@ Trashed records are excluded from normal reads, relations, back-relations, `@col
 
 With `softDelete` enabled, unique indexes exclude trashed rows while keeping index definitions unchanged; disabling gives the earlier expressions back.
 
-Cascade-delete dependents are trashed recursively. Trashing leaves stored relation values alone, cascading or not, so restoring the target makes its prior matches visible again. A multi-value relation follows only if the trashed record was its last visible target. Every record one delete trashes shares that delete's timestamp; separate deletes never share one. `App.RestoreRecord` accepts any member of such a group, whichever end it is given, finds the others by that timestamp, and restores them together in any dependency order. A record still cannot come back while a record it points at through a cascading relation sits in the trash outside that group; trashed records pointing at it never hold it back. Restoring an untrashed record does nothing; without `softDelete` it errors. The restored record comes back live in place.
+Cascade-delete dependents are trashed recursively. Trashing leaves stored relation values alone, cascading or not, so restoring the target makes its prior matches visible again. A multi-value relation follows only if the trashed record was its last visible target. Every record one delete trashes shares that delete's timestamp; separate deletes never share one. `App.RestoreRecord` accepts any member of such a group, whichever end it is given, finds the others by that timestamp, and restores them together in any dependency order, each coming back live in place. A record still cannot come back while a record it points at through a cascading relation sits in the trash outside that group; trashed records pointing at it never hold it back. Restoring an untrashed record does nothing; without `softDelete` it errors.
 
 `App.PurgeTrashedRecords` clears records trashed before a `types.DateTime` cutoff (zero value purges all) and reports how many went; a collection without `softDelete` errors. `App.PurgeExpiredTrashedRecords` applies collection retentions, skipping those without one, and returns an error alone.
 
@@ -16,6 +16,6 @@ List and view accept `trashed=with` for live and trashed records, or `trashed=on
 
 `DELETE /api/collections/{collection}/records/{id}` takes a boolean `purge` (`true` permanently deletes; non-boolean returns 400). Without `purge`, trashed IDs return 404.
 
-`POST /api/collections/{collection}/records/{id}/restore` uses the collection update rule and returns the restored record (403 if rule is nil, 404 if rule fails or untrashed, 400 without `softDelete`). Add this route to the batch endpoint's allowed actions as well, so a restore can be sent through `/api/batch` like a create, update or delete.
+`POST /api/collections/{collection}/records/{id}/restore` uses the collection update rule and returns the restored record (403 if rule is nil, 404 if rule fails or untrashed, 400 without `softDelete`). Add this route to the batch endpoint's allowed actions as well.
 
 `DELETE /api/collections/{collection}/trash` requires superuser access (401 for guests), accepts an optional `before` datetime, rejecting an unparsable one with 400 instead of treating it as absent, returns the count under `purged`, and errors with 400 without `softDelete`.
