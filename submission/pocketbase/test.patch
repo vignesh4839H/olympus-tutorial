@@ -329,10 +329,10 @@ index 0000000..5623cef
 +}
 diff --git a/softdeletetests/api_soft_delete_280aff_test.go b/softdeletetests/api_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..2e665b4
+index 0000000..61e13bb
 --- /dev/null
 +++ b/softdeletetests/api_soft_delete_280aff_test.go
-@@ -0,0 +1,693 @@
+@@ -0,0 +1,789 @@
 +package softdeletetests
 +
 +import (
@@ -340,6 +340,7 @@ index 0000000..2e665b4
 +	"strings"
 +	"testing"
 +
++	"github.com/pocketbase/dbx"
 +	"github.com/pocketbase/pocketbase/core"
 +	"github.com/pocketbase/pocketbase/tests"
 +)
@@ -1017,6 +1018,101 @@ index 0000000..2e665b4
 +
 +				if trashed.GetString("title") != "trashed one" {
 +					t.Fatalf("expected the title to be unchanged, got %q", trashed.GetString("title"))
++				}
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
++
++const sdOldTrashedRecordId = "sdapiold0000001"
++
++func TestSoftDeleteInvalidTrashedValueIsIgnoredByRegularCollections(t *testing.T) {
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "the list route ignores an invalid value on a regular collection",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_plain/records?trashed=yes",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"totalItems":1`,
++				`"id":"` + sdPlainRecordId + `"`,
++			},
++		},
++		{
++			Name:           "the view route ignores an invalid value on a regular collection",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_plain/records/" + sdPlainRecordId + "?trashed=yes",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdPlainRecordId + `"`,
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
++
++func TestSoftDeleteEmptyTrashApiBeforeRemovesOnlyTheOlder(t *testing.T) {
++	scenarios := []tests.ApiScenario{
++		{
++			Name:   "before removes the older trashed record and keeps the newer",
++			Method: http.MethodDelete,
++			URL:    "/api/collections/sd_api_posts/trash?before=2020-01-01%2000%3A00%3A00.000Z",
++			Headers: map[string]string{
++				"Authorization": sdSuperuserToken,
++			},
++			BeforeTestFunc: func(t testing.TB, app *tests.TestApp, e *core.ServeEvent) {
++				sdApiSetup(t, app)
++
++				posts, err := app.FindCollectionByNameOrId("sd_api_posts")
++				if err != nil {
++					t.Fatal(err)
++				}
++
++				old := core.NewRecord(posts)
++				old.Id = sdOldTrashedRecordId
++				old.Set("title", "trashed long ago")
++				if err := app.Save(old); err != nil {
++					t.Fatal(err)
++				}
++				if err := app.Delete(old); err != nil {
++					t.Fatal(err)
++				}
++
++				// well before the cutoff, while the setup's trashed record is
++				// stamped now and has to survive
++				_, err = app.DB().Update(
++					posts.Name,
++					dbx.Params{core.FieldNameDeleted: "2019-01-01 00:00:00.000Z"},
++					dbx.HashExp{"id": sdOldTrashedRecordId},
++				).Execute()
++				if err != nil {
++					t.Fatal(err)
++				}
++			},
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"purged":1`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindRecordByIdWithTrashed("sd_api_posts", sdOldTrashedRecordId); err == nil {
++					t.Fatal("expected the older trashed record to be purged")
++				}
++
++				if _, err := app.FindTrashedRecordById("sd_api_posts", sdTrashedRecordId); err != nil {
++					t.Fatalf("expected the recently trashed record to be kept, got %v", err)
++				}
++
++				if _, err := app.FindRecordById("sd_api_posts", sdLiveRecordId); err != nil {
++					t.Fatalf("expected the live record to be untouched, got %v", err)
 +				}
 +			},
 +		},
