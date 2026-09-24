@@ -873,15 +873,16 @@ index 0000000..8537ba5
 +}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..f83dfa4
+index 0000000..d270b86
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,1787 @@
+@@ -0,0 +1,1898 @@
 +package softdeletetests
 +
 +import (
 +	"database/sql"
 +	"errors"
++	"slices"
 +	"strings"
 +	"testing"
 +	"time"
@@ -2663,6 +2664,116 @@ index 0000000..f83dfa4
 +			t.Fatalf("expected the %s row to be gone, it is still there", pair.label)
 +		}
 +	}
++}
++
++func TestSoftDeletePartialUniqueIndexKeepsItsCondition(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	collection := core.NewBaseCollection("sd_partial_index")
++	collection.Fields.Add(&core.TextField{Name: "title"})
++	collection.Fields.Add(&core.TextField{Name: "status"})
++	// the constraint only ever applied to the "active" rows
++	collection.AddIndex("idx_sd_partial_title", true, "`title`", "`status` = 'active'")
++	collection.SoftDelete = true
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	active := sdNewRecord(t, app, collection, map[string]any{"title": "same", "status": "active"})
++
++	// the original condition has to survive: a draft row was never covered by
++	// the constraint, so it may reuse the value
++	draft := core.NewRecord(collection)
++	draft.Set("title", "same")
++	draft.Set("status", "draft")
++	if err := app.Save(draft); err != nil {
++		t.Fatalf("expected the rows outside the index condition to stay unconstrained, got %v", err)
++	}
++
++	// ... while a second active row still collides
++	conflict := core.NewRecord(collection)
++	conflict.Set("title", "same")
++	conflict.Set("status", "active")
++	if err := app.Save(conflict); err == nil {
++		t.Fatal("expected the original unique condition to still reject a second active row")
++	}
++
++	// ... and the trashed rows drop out of it
++	if err := app.Delete(active); err != nil {
++		t.Fatal(err)
++	}
++
++	replacement := core.NewRecord(collection)
++	replacement.Set("title", "same")
++	replacement.Set("status", "active")
++	if err := app.Save(replacement); err != nil {
++		t.Fatalf("expected the trashed row to free its unique value, got %v", err)
++	}
++}
++
++func TestSoftDeleteMultiValueRelationKeepsEveryStoredId(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	comments.Fields.Add(&core.RelationField{
++		Name:          "posts",
++		CollectionId:  posts.Id,
++		CascadeDelete: true,
++		MaxSelect:     5,
++	})
++	if err := app.Save(comments); err != nil {
++		t.Fatal(err)
++	}
++
++	first := sdNewRecord(t, app, posts, map[string]any{"title": "first"})
++	second := sdNewRecord(t, app, posts, map[string]any{"title": "second"})
++	comment := sdNewRecord(t, app, comments, map[string]any{
++		"message": "shared",
++		"posts":   []string{first.Id, second.Id},
++	})
++
++	assertStoredIds := func(label string) {
++		t.Helper()
++
++		reloaded, err := app.FindRecordByIdWithTrashed(comments, comment.Id)
++		if err != nil {
++			t.Fatalf("%s: %v", label, err)
++		}
++
++		stored := reloaded.GetStringSlice("posts")
++		if len(stored) != 2 {
++			t.Fatalf("%s: expected both ids to be kept, got %v", label, stored)
++		}
++
++		for _, want := range []string{first.Id, second.Id} {
++			if !slices.Contains(stored, want) {
++				t.Fatalf("%s: expected %q to still be stored, got %v", label, want, stored)
++			}
++		}
++	}
++
++	assertStoredIds("before")
++
++	// trashing one target must not rewrite the referencing record's value
++	if err := app.Delete(first); err != nil {
++		t.Fatal(err)
++	}
++
++	assertStoredIds("after the target is trashed")
++
++	trashed, err := app.FindTrashedRecordById(posts, first.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.RestoreRecord(trashed); err != nil {
++		t.Fatal(err)
++	}
++
++	assertStoredIds("after the target is restored")
 +}
 diff --git a/test.sh b/test.sh
 new file mode 100755
