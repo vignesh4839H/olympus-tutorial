@@ -8,11 +8,7 @@ Trashed records are excluded from normal reads, relations, back-relations, `@col
 
 With `softDelete` enabled, unique indexes exclude trashed rows while keeping index definitions unchanged; disabling gives the earlier expressions back.
 
-Cascade-delete dependents are trashed recursively. Trashing leaves stored relation values alone, cascading or not, so restoring the target makes its prior matches visible again. A multi-value relation follows only if the trashed record was its last visible target.
-
-Every record one delete trashes shares that delete's timestamp, and separate deletes never share one. `App.RestoreRecord` accepts any member of that group, whichever end it is given, finds the others by that timestamp, and restores them together in any dependency order. Each comes back live in place.
-
-A record still cannot come back while a record it points at through a cascading relation sits in the trash outside its group. Trashed records pointing at it never hold it back. Restoring an untrashed record does nothing, and restoring without `softDelete` errors.
+Cascade-delete dependents are trashed recursively. Trashing leaves stored relation values alone, cascading or not, so restoring the target makes its prior matches visible again. A multi-value relation follows only if the trashed record was its last visible target. Every record one delete trashes shares that delete's timestamp; separate deletes never share one. `App.RestoreRecord` accepts any member of such a group, whichever end it is given, finds the others by that timestamp, and restores them together in any dependency order, each coming back live in place. A record still cannot come back while a record it points at through a cascading relation sits in the trash outside that group; trashed records pointing at it never hold it back. Restoring an untrashed record does nothing; without `softDelete` it errors.
 
 `App.PurgeTrashedRecords` clears records trashed before a `types.DateTime` cutoff (zero value purges all) and reports how many went; a collection without `softDelete` errors. `App.PurgeExpiredTrashedRecords` applies collection retentions, skipping those without one, and returns an error alone.
 
