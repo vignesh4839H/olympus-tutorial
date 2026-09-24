@@ -329,10 +329,10 @@ index 0000000..5623cef
 +}
 diff --git a/softdeletetests/api_soft_delete_280aff_test.go b/softdeletetests/api_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..8537ba5
+index 0000000..eec85cc
 --- /dev/null
 +++ b/softdeletetests/api_soft_delete_280aff_test.go
-@@ -0,0 +1,538 @@
+@@ -0,0 +1,602 @@
 +package softdeletetests
 +
 +import (
@@ -871,12 +871,76 @@ index 0000000..8537ba5
 +		scenario.Test(t)
 +	}
 +}
++
++func TestSoftDeleteTrashedApiOutputCarriesTheTimestamp(t *testing.T) {
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "a trashed record reports when it was trashed",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records/" + sdTrashedRecordId + "?trashed=with",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdTrashedRecordId + `"`,
++				`"deleted":"20`,
++			},
++			NotExpectedContent: []string{
++				`"deleted":""`,
++			},
++		},
++		{
++			Name:           "a trashed record is viewable with trashed=only",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records/" + sdTrashedRecordId + "?trashed=only",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdTrashedRecordId + `"`,
++			},
++		},
++		{
++			Name:           "an unknown trashed value is rejected by the view route",
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId + "?trashed=yes",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 400,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
++
++func TestSoftDeleteRecordDeleteApiExplicitPurgeFalse(t *testing.T) {
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "purge=false still moves the record to the trash",
++			Method:         http.MethodDelete,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId + "?purge=false",
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 204,
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindTrashedRecordById("sd_api_posts", sdLiveRecordId); err != nil {
++					t.Fatalf("expected the record to be trashed, got %v", err)
++				}
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..d270b86
+index 0000000..72ff3ee
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,1898 @@
+@@ -0,0 +1,2003 @@
 +package softdeletetests
 +
 +import (
@@ -2774,6 +2838,111 @@ index 0000000..d270b86
 +	}
 +
 +	assertStoredIds("after the target is restored")
++}
++
++func TestSoftDeleteTogglingKeepsDeletedLikeIndexes(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	collection := core.NewBaseCollection("sd_deleted_like")
++	collection.Fields.Add(&core.TextField{Name: "title"})
++	collection.Fields.Add(&core.NumberField{Name: "is_deleted"})
++	collection.Fields.Add(&core.TextField{Name: "status"})
++	// neither condition refers to the generated field: one names a longer
++	// column, the other only spells it inside a string literal
++	collection.AddIndex("idx_sd_like_column", true, "`title`", "`is_deleted` = 0")
++	collection.AddIndex("idx_sd_like_literal", true, "`status`", "`title` != 'deleted'")
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	columnIndex := collection.GetIndex("idx_sd_like_column")
++	literalIndex := collection.GetIndex("idx_sd_like_literal")
++
++	collection.SoftDelete = true
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	collection.SoftDelete = false
++	if err := app.Save(collection); err != nil {
++		t.Fatalf("expected the mode to be turned off again, got %v", err)
++	}
++
++	if got := collection.GetIndex("idx_sd_like_column"); got != columnIndex {
++		t.Fatalf("expected\n%q\nto be kept, got\n%q", columnIndex, got)
++	}
++
++	if got := collection.GetIndex("idx_sd_like_literal"); got != literalIndex {
++		t.Fatalf("expected\n%q\nto be kept, got\n%q", literalIndex, got)
++	}
++}
++
++func TestSoftDeleteRetentionSurvivesAReload(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	collection := core.NewBaseCollection("sd_retention_reload")
++	collection.SoftDelete = true
++	collection.TrashRetention = 7200
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	reloaded, err := app.FindCollectionByNameOrId("sd_retention_reload")
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if reloaded.TrashRetention != 7200 {
++		t.Fatalf("expected the retention to be persisted, got %d", reloaded.TrashRetention)
++	}
++
++	raw, err := reloaded.MarshalJSON()
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if !strings.Contains(string(raw), `"trashRetention":7200`) {
++		t.Fatalf("expected the retention in\n%s", raw)
++	}
++}
++
++func TestSoftDeleteNoncascadeDependencyDoesNotBlockRestore(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	// the relation does not cascade, so a trashed target is not a dependency
++	comments.Fields.Add(&core.RelationField{Name: "related", CollectionId: posts.Id})
++	if err := app.Save(comments); err != nil {
++		t.Fatal(err)
++	}
++
++	target := sdNewRecord(t, app, posts, map[string]any{"title": "loose target"})
++	comment := sdNewRecord(t, app, comments, map[string]any{"message": "hi", "related": target.Id})
++
++	// two separate deletes, so they never share a group
++	if err := app.Delete(comment); err != nil {
++		t.Fatal(err)
++	}
++	if err := app.Delete(target); err != nil {
++		t.Fatal(err)
++	}
++
++	trashed, err := app.FindTrashedRecordById(comments, comment.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.RestoreRecord(trashed); err != nil {
++		t.Fatalf("expected only cascade dependencies to block a restore, got %v", err)
++	}
++
++	if _, err := app.FindRecordById(comments, comment.Id); err != nil {
++		t.Fatalf("expected the comment to be live again, got %v", err)
++	}
 +}
 diff --git a/test.sh b/test.sh
 new file mode 100755

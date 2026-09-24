@@ -551,7 +551,7 @@ index e169a55..60c8e3e 100644
  				return fmt.Errorf("failed to save collection %q: %w", imported.Name, err)
  			}
 diff --git a/core/collection_model.go b/core/collection_model.go
-index 2ed040a..b6253a0 100644
+index 2ed040a..ac37d25 100644
 --- a/core/collection_model.go
 +++ b/core/collection_model.go
 @@ -3,6 +3,7 @@ package core
@@ -680,7 +680,7 @@ index 2ed040a..b6253a0 100644
  	case CollectionTypeAuth:
  		c.initIdField()
  		c.initPasswordField()
-@@ -983,6 +1044,182 @@ func (c *Collection) initIdField() {
+@@ -983,6 +1044,185 @@ func (c *Collection) initIdField() {
  	}
  }
  
@@ -817,7 +817,10 @@ index 2ed040a..b6253a0 100644
 +		}
 +	}
 +
-+	return strings.Contains(strings.ToLower(parsed.Where), strings.ToLower(FieldNameDeleted))
++	// the condition is read as SQL rather than as text: a column such as
++	// "is_deleted" contains the generated name but is not it, and a literal
++	// that spells it is not a reference either
++	return mentionsIdentifier(stripStringLiterals(parsed.Where), FieldNameDeleted)
 +}
 +
 +// isSoftDeleteFieldIndex reports whether the expression is the plain single
@@ -1825,10 +1828,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..6964850
+index 0000000..d9f3efd
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,1039 @@
+@@ -0,0 +1,1069 @@
 +package core
 +
 +import (
@@ -2056,7 +2059,7 @@ index 0000000..6964850
 +	sort.Strings(names)
 +
 +	for _, name := range names {
-+		if queryMentionsCollection(selectQuery, name) {
++		if mentionsIdentifier(selectQuery, name) {
 +			return name, nil
 +		}
 +	}
@@ -2073,7 +2076,7 @@ index 0000000..6964850
 +	}
 +
 +	for _, view := range views {
-+		if queryMentionsCollection(view.ViewQuery, collection.Name) {
++		if mentionsIdentifier(view.ViewQuery, collection.Name) {
 +			return view.Name, nil
 +		}
 +	}
@@ -2081,8 +2084,8 @@ index 0000000..6964850
 +	return "", nil
 +}
 +
-+// queryMentionsCollection reports whether the raw view SQL names the
-+// collection anywhere, as a whole word and without regard to case.
++// mentionsIdentifier reports whether the SQL names the identifier anywhere,
++// as a whole word and without regard to case.
 +//
 +// The check reads the query text rather than its parsed sources on purpose.
 +// The identifier parser splits on commas and whitespace alone, so a CTE or a
@@ -2092,12 +2095,12 @@ index 0000000..6964850
 +// the tables underneath. Reading the text refuses more than it strictly has
 +// to, which is the safe direction for a rule whose failure is exposing
 +// trashed rows.
-+func queryMentionsCollection(query string, name string) bool {
-+	if query == "" || name == "" {
++func mentionsIdentifier(text string, name string) bool {
++	if text == "" || name == "" {
 +		return false
 +	}
 +
-+	haystack := strings.ToLower(query)
++	haystack := strings.ToLower(text)
 +	needle := strings.ToLower(name)
 +
 +	for offset := 0; offset <= len(haystack)-len(needle); {
@@ -2138,6 +2141,36 @@ index 0000000..6964850
 +		return 0
 +	}
 +	return s[i]
++}
++
++// stripStringLiterals blanks out the single quoted literals of an SQL
++// expression so that their contents are not mistaken for identifiers.
++func stripStringLiterals(expr string) string {
++	var b strings.Builder
++	b.Grow(len(expr))
++
++	inLiteral := false
++
++	for i := 0; i < len(expr); i++ {
++		c := expr[i]
++
++		if c == '\'' {
++			inLiteral = !inLiteral
++			b.WriteByte(' ')
++
++			continue
++		}
++
++		if inLiteral {
++			b.WriteByte(' ')
++
++			continue
++		}
++
++		b.WriteByte(c)
++	}
++
++	return b.String()
 +}
 +
 +// notTrashedExpr returns the expression matching only the records of the
