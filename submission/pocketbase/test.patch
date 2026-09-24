@@ -1124,10 +1124,10 @@ index 0000000..61e13bb
 +}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..8563d1b
+index 0000000..3355e1a
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,2345 @@
+@@ -0,0 +1,2433 @@
 +package softdeletetests
 +
 +import (
@@ -1394,12 +1394,19 @@ index 0000000..8563d1b
 +		}
 +	})
 +
-+	t.Run("the model is marked as trashed", func(t *testing.T) {
-+		if !record.IsTrashed() {
-+			t.Fatal("expected the in-memory record to be marked as trashed")
++	t.Run("a loaded record answers the trash accessors", func(t *testing.T) {
++		// read back rather than inspecting the object handed to Delete: the
++		// contract is about the record's state, not about the caller's pointer
++		loaded, err := app.FindRecordByIdWithTrashed(posts, record.Id)
++		if err != nil {
++			t.Fatal(err)
 +		}
 +
-+		if record.TrashedAt().IsZero() {
++		if !loaded.IsTrashed() {
++			t.Fatal("expected the loaded record to report itself as trashed")
++		}
++
++		if loaded.TrashedAt().IsZero() {
 +			t.Fatal("expected a non-zero trash timestamp")
 +		}
 +	})
@@ -1970,10 +1977,20 @@ index 0000000..8563d1b
 +		t.Fatal(err)
 +	}
 +
-+	if first.TrashedAt().String() == second.TrashedAt().String() {
++	trashedFirst, err := app.FindTrashedRecordById(posts, first.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	trashedSecond, err := app.FindTrashedRecordById(posts, second.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if trashedFirst.TrashedAt().String() == trashedSecond.TrashedAt().String() {
 +		t.Fatalf(
 +			"expected two separate deletes to use different trash timestamps, got %q for both",
-+			first.TrashedAt().String(),
++			trashedFirst.TrashedAt().String(),
 +		)
 +	}
 +}
@@ -2457,10 +2474,19 @@ index 0000000..8563d1b
 +		t.Fatal(err)
 +	}
 +
-+	// the same instance is live now, so an ordinary update of it must go through
-+	trashed.Set("title", "changed after restore")
++	// the record is live again, so an ordinary update of it must go through
++	restored, err := app.FindRecordById(posts, record.Id)
++	if err != nil {
++		t.Fatalf("expected the record to be live again, got %v", err)
++	}
 +
-+	if err := app.Save(trashed); err != nil {
++	if !restored.TrashedAt().IsZero() {
++		t.Fatalf("expected the restored record to carry no trash time, got %q", restored.TrashedAt().String())
++	}
++
++	restored.Set("title", "changed after restore")
++
++	if err := app.Save(restored); err != nil {
 +		t.Fatalf("expected the restored record to be saveable again, got %v", err)
 +	}
 +
@@ -2667,7 +2693,12 @@ index 0000000..8563d1b
 +	}
 +
 +	// restoring the post brings the match back
-+	if err := app.RestoreRecord(post); err != nil {
++	trashedPost, err := app.FindTrashedRecordById(posts, post.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.RestoreRecord(trashedPost); err != nil {
 +		t.Fatal(err)
 +	}
 +
@@ -3472,6 +3503,63 @@ index 0000000..8563d1b
 +			t.Fatal("expected the trash lookups to stay unsupported for a view collection")
 +		}
 +	})
++}
++
++func TestSoftDeleteTrashAccessorsOnLoadedRecords(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	record := sdNewRecord(t, app, posts, map[string]any{"title": "accessors"})
++
++	live, err := app.FindRecordById(posts, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if live.IsTrashed() || !live.TrashedAt().IsZero() {
++		t.Fatalf("expected a live record to report no trash time, got %q", live.TrashedAt().String())
++	}
++
++	if err := app.Delete(record); err != nil {
++		t.Fatal(err)
++	}
++
++	trashed, err := app.FindTrashedRecordById(posts, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if !trashed.IsTrashed() || trashed.TrashedAt().IsZero() {
++		t.Fatal("expected a trashed record to report a trash time")
++	}
++
++	withTrashed, err := app.FindRecordByIdWithTrashed(posts, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if withTrashed.TrashedAt().String() != trashed.TrashedAt().String() {
++		t.Fatalf(
++			"expected both trash-aware lookups to agree, got %q and %q",
++			withTrashed.TrashedAt().String(),
++			trashed.TrashedAt().String(),
++		)
++	}
++
++	if err := app.RestoreRecord(trashed); err != nil {
++		t.Fatal(err)
++	}
++
++	restored, err := app.FindRecordById(posts, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if restored.IsTrashed() || !restored.TrashedAt().IsZero() {
++		t.Fatalf("expected a restored record to report no trash time, got %q", restored.TrashedAt().String())
++	}
 +}
 diff --git a/test.sh b/test.sh
 new file mode 100755
