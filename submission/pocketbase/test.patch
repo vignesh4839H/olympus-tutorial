@@ -329,10 +329,10 @@ index 0000000..5623cef
 +}
 diff --git a/softdeletetests/api_soft_delete_280aff_test.go b/softdeletetests/api_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..fa0b0d3
+index 0000000..2e665b4
 --- /dev/null
 +++ b/softdeletetests/api_soft_delete_280aff_test.go
-@@ -0,0 +1,634 @@
+@@ -0,0 +1,693 @@
 +package softdeletetests
 +
 +import (
@@ -959,6 +959,65 @@ index 0000000..fa0b0d3
 +				`"totalItems":2`,
 +				`"id":"` + sdLiveRecordId + `"`,
 +				`"id":"` + sdTrashedRecordId + `"`,
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
++
++const sdRegularUserToken = "eyJhbGciOiJIUzI1NiJ9.eyJpZCI6IjRxMXhsY2xtZmxva3UzMyIsInR5cGUiOiJhdXRoIiwiY29sbGVjdGlvbklkIjoiX3BiX3VzZXJzX2F1dGhfIiwiZXhwIjoyNTI0NjA0NDYxLCJyZWZyZXNoYWJsZSI6dHJ1ZX0.ZT3F0Z3iM-xbGgSG3LEKiEzHrPHr8t8IuHLZGGNuxLo"
++
++func TestSoftDeleteEmptyTrashApiRejectsRegularUsers(t *testing.T) {
++	scenarios := []tests.ApiScenario{
++		{
++			Name:   "an authenticated regular user cannot empty the trash",
++			Method: http.MethodDelete,
++			URL:    "/api/collections/sd_api_posts/trash",
++			Headers: map[string]string{
++				"Authorization": sdRegularUserToken,
++			},
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 403,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindTrashedRecordById("sd_api_posts", sdTrashedRecordId); err != nil {
++					t.Fatalf("expected the trash to be untouched, got %v", err)
++				}
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
++		scenario.Test(t)
++	}
++}
++
++func TestSoftDeleteTrashedRecordCannotBeUpdatedOverTheApi(t *testing.T) {
++	scenarios := []tests.ApiScenario{
++		{
++			Name:           "a trashed record is not updatable",
++			Method:         http.MethodPatch,
++			URL:            "/api/collections/sd_api_posts/records/" + sdTrashedRecordId,
++			Body:           strings.NewReader(`{"title":"changed"}`),
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 404,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				trashed, err := app.FindTrashedRecordById("sd_api_posts", sdTrashedRecordId)
++				if err != nil {
++					t.Fatalf("expected the record to stay in the trash, got %v", err)
++				}
++
++				if trashed.GetString("title") != "trashed one" {
++					t.Fatalf("expected the title to be unchanged, got %q", trashed.GetString("title"))
++				}
 +			},
 +		},
 +	}
