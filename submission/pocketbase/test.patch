@@ -937,10 +937,10 @@ index 0000000..eec85cc
 +}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..72ff3ee
+index 0000000..d6122e0
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,2003 @@
+@@ -0,0 +1,2069 @@
 +package softdeletetests
 +
 +import (
@@ -2942,6 +2942,72 @@ index 0000000..72ff3ee
 +
 +	if _, err := app.FindRecordById(comments, comment.Id); err != nil {
 +		t.Fatalf("expected the comment to be live again, got %v", err)
++	}
++}
++
++func TestSoftDeleteSecondDeleteCascadesThroughEveryLevel(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	root, middle, child := sdDependencyChain(t, app)
++
++	rootRecord := sdNewRecord(t, app, root, map[string]any{"title": "root"})
++	middleRecord := sdNewRecord(t, app, middle, map[string]any{"root": rootRecord.Id})
++	liveLeaf := sdNewRecord(t, app, child, map[string]any{
++		"root":   rootRecord.Id,
++		"middle": middleRecord.Id,
++	})
++	trashedLeaf := sdNewRecord(t, app, child, map[string]any{
++		"root":   rootRecord.Id,
++		"middle": middleRecord.Id,
++	})
++
++	// one leaf goes to the trash on its own beforehand
++	if err := app.Delete(trashedLeaf); err != nil {
++		t.Fatal(err)
++	}
++
++	// the first delete only trashes the chain
++	if err := app.Delete(rootRecord); err != nil {
++		t.Fatal(err)
++	}
++
++	for _, pair := range []struct {
++		collection *core.Collection
++		id         string
++		label      string
++	}{
++		{middle, middleRecord.Id, "middle"},
++		{child, liveLeaf.Id, "live leaf"},
++	} {
++		if !sdRawExists(t, app, pair.collection, pair.id) {
++			t.Fatalf("expected the %s row to survive the first delete", pair.label)
++		}
++	}
++
++	trashedRoot, err := app.FindTrashedRecordById(root, rootRecord.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// the second one takes every level for good
++	if err := app.Delete(trashedRoot); err != nil {
++		t.Fatal(err)
++	}
++
++	for _, pair := range []struct {
++		collection *core.Collection
++		id         string
++		label      string
++	}{
++		{root, rootRecord.Id, "root"},
++		{middle, middleRecord.Id, "middle"},
++		{child, liveLeaf.Id, "live leaf"},
++		{child, trashedLeaf.Id, "already trashed leaf"},
++	} {
++		if sdRawExists(t, app, pair.collection, pair.id) {
++			t.Fatalf("expected the %s row to be gone, it is still there", pair.label)
++		}
 +	}
 +}
 diff --git a/test.sh b/test.sh
