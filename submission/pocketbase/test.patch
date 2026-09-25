@@ -3749,10 +3749,10 @@ index 0000000..f3cec0c
 +}
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..34b146b
+index 0000000..9dcd471
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,123 @@
+@@ -0,0 +1,133 @@
 +#!/usr/bin/env bash
 +#
 +# Usage:
@@ -3807,14 +3807,24 @@ index 0000000..34b146b
 +    # build their subtest names out of pointer addresses and random file names,
 +    # so the names differ between runs even though the results never do, which
 +    # makes a report diff look unstable.
-+    RUN_ARGS=(-skip '^(TestRecordAuthWithOAuth2|TestBatchRequest|TestNotifyWatcher_CollectionsUpdate|TestNotifyWatcher_SettingsUpdate|TestRealtimeRecordResolve|TestFileFieldDriverValue|TestFileFieldPrepareValue|TestRecordGetBool|TestRecordGetDateTime|TestRecordGetFloat|TestRecordGetInt|TestRecordGetInt64|TestRecordGetStringSlice)$')
-+    # TestBatchRequest is skipped above only to drop one of its cases:
++    RUN_ARGS=(-skip '^(TestRecordAuthWithOAuth2|TestBatchRequest|TestNotifyWatcher_CollectionsUpdate|TestNotifyWatcher_SettingsUpdate|TestRealtimeRecordResolve|TestRecordCrudDelete|TestRecordRequestOTP|TestFileFieldDriverValue|TestFileFieldPrepareValue|TestRecordGetBool|TestRecordGetDateTime|TestRecordGetFloat|TestRecordGetInt|TestRecordGetInt64|TestRecordGetStringSlice)$')
++    # The three tests above are skipped only to drop five of their cases, and
++    # the rest of each comes back in a second pass. Go matches -skip a level
++    # at a time and takes a single pattern, so a case can only be dropped by
++    # naming its test at the top level, which takes the whole test with it.
++    #
 +    # "transaction timeout" gives the batch a one second budget and sleeps
 +    # 600ms per request, so which request the deadline lands on depends on
-+    # how loaded the machine is. Go matches -skip a level at a time and takes
-+    # a single pattern, so the rest of the test comes back in a second pass.
++    # how loaded the machine is. The two record delete cases wait 100ms and
++    # then read the record's storage directory, which a background goroutine
++    # empties. The two request-otp cases wait the same 100ms and then count
++    # the events of an email send that is dispatched the same way. All five
++    # answer on the clock rather than on the code.
 +    EXTRA_PACKAGES=(./apis/)
-+    EXTRA_RUN_ARGS=(-run '^TestBatchRequest$' -skip '^TestBatchRequest$/^transaction_timeout$')
++    EXTRA_RUN_ARGS=(
++      -run '^(TestBatchRequest|TestRecordCrudDelete|TestRecordRequestOTP)$'
++      -skip '^(TestBatchRequest|TestRecordCrudDelete|TestRecordRequestOTP)$/^(transaction_timeout|authenticated_record_that_match_the_collection_delete_rule|delete_a_record_with_cascade_references|existing_auth_record_\(with_<_9_non-expired\)|existing_auth_record_with_intercepted_email_\(with_<_9_non-expired\))$'
++    )
 +    ;;
 +  new)
 +    PACKAGES=(./softdeletetests/)
