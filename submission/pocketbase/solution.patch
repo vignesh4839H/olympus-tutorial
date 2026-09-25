@@ -1454,7 +1454,7 @@ index fa65893..08abbbc 100644
  		}
  
 diff --git a/core/record_model.go b/core/record_model.go
-index b654864..15fafc3 100644
+index b654864..3c0bcb1 100644
 --- a/core/record_model.go
 +++ b/core/record_model.go
 @@ -50,6 +50,10 @@ type Record struct {
@@ -1499,9 +1499,9 @@ index b654864..15fafc3 100644
 +			return err
 +		}
 +		if trashed {
-+			// the row stays, but the rest of the delete execute chain still
-+			// has to run so that handlers bound after this one are not lost
-+			return e.Next()
++			// trashRecord ran the rest of the delete execute chain inside its
++			// own transaction, so there is nothing left to advance here
++			return nil
 +		}
 +
 +		// the row turned out to be in the trash already, so this delete is
@@ -1830,10 +1830,10 @@ index 7a87da5..f17f035 100644
  			for _, record := range records {
 diff --git a/core/record_trash.go b/core/record_trash.go
 new file mode 100644
-index 0000000..d9f3efd
+index 0000000..4bdbc33
 --- /dev/null
 +++ b/core/record_trash.go
-@@ -0,0 +1,1069 @@
+@@ -0,0 +1,1012 @@
 +package core
 +
 +import (
@@ -2201,7 +2201,8 @@ index 0000000..d9f3efd
 +	}
 +
 +	// every record trashed as part of this delete shares the same timestamp
-+	// so that a later restore can bring back exactly the same group
++	// so that a later restore can bring back exactly the same group, and the
++	// whole transition is one transaction, the way a permanent delete is
 +	originalApp := e.App
 +	txErr := e.App.RunInTransaction(func(txApp App) error {
 +		e.App = txApp
@@ -2225,7 +2226,15 @@ index 0000000..d9f3efd
 +			return err
 +		}
 +
-+		return cascadeRecordTrash(txApp, withTrashTimestamp(e.Context, trashedAt), e.Record, refs)
++		if err := cascadeRecordTrash(txApp, withTrashTimestamp(e.Context, trashedAt), e.Record, refs); err != nil {
++			return err
++		}
++
++		// the row stays where it is, but the rest of the delete execute chain
++		// still has to run, and it has to run here: a handler bound after this
++		// one that fails must take the transition back with it rather than
++		// leave the caller with a failed delete and an invisible record
++		return e.Next()
 +	})
 +	e.App = originalApp
 +
@@ -2335,13 +2344,13 @@ index 0000000..d9f3efd
 +	maxTrashRetentionSeconds = maxTrashRetention / time.Second
 +)
 +
-+// eachReferencingRecordId walks the ids of the records referencing the main
-+// record and invokes the callback for each of them.
++// eachRecordId walks the ids matched by the built query and invokes the
++// callback for each of them.
 +//
 +// The rows are paged with an id cursor rather than an offset because the
-+// callback modifies the very rows the query matches, which would otherwise
++// callback can modify the very rows the query matches, which would otherwise
 +// either skip rows or loop forever.
-+func eachReferencingRecordId(
++func eachRecordId(
 +	idColumn string,
 +	build func(cursor string) *dbx.SelectQuery,
 +	callback func(refId string) error,
@@ -2399,7 +2408,7 @@ index 0000000..d9f3efd
 +
 +			idColumn := inflector.Columnify(refCollection.Name) + ".id"
 +
-+			err := eachReferencingRecordId(
++			err := eachRecordId(
 +				idColumn,
 +				func(cursor string) *dbx.SelectQuery {
 +					return referencingRecordIdsQuery(app, mainRecord, refCollection, field).
@@ -2459,132 +2468,66 @@ index 0000000..d9f3efd
 +	return collectionId + "/" + recordId
 +}
 +
-+// collectCascadeTargets adds the records that the provided one cascade-depends
-+// on to the restore group, as long as they carry its trash timestamp.
++// collectRestoreGroup gathers the records that went into the trash together
++// with the provided one, aka. every trashed record stamped with its exact
++// timestamp.
 +//
-+// A target that was already in the trash before the group went there carries a
-+// different timestamp and stays behind, where the dependency check turns it
-+// into a blocked restore rather than a silent one.
-+func collectCascadeTargets(app App, record *Record, trashedAt types.DateTime, seen map[string]bool, group *[]*Record) error {
-+	for _, field := range record.Collection().Fields {
-+		relField, ok := field.(*RelationField)
-+		if !ok || !relField.CascadeDelete {
-+			continue
-+		}
-+
-+		relCollection, err := app.FindCachedCollectionByNameOrId(relField.CollectionId)
-+		if err != nil || relCollection == nil || !relCollection.IsSoftDeleteEnabled() {
-+			continue
-+		}
-+
-+		for _, relId := range record.GetStringSlice(relField.Name) {
-+			key := restoreGroupKey(relCollection.Id, relId)
-+			if seen[key] {
-+				continue
-+			}
-+
-+			relRecord, err := app.FindTrashedRecordById(relCollection, relId)
-+			if err != nil {
-+				if errors.Is(err, sql.ErrNoRows) {
-+					continue // already live, or gone for good
-+				}
-+				return err
-+			}
-+
-+			if relRecord.TrashedAt().String() != trashedAt.String() {
-+				continue // trashed on its own, so not part of this group
-+			}
-+
-+			seen[key] = true
-+			*group = append(*group, relRecord)
-+		}
-+	}
-+
-+	return nil
-+}
-+
-+// collectRestoreGroup gathers the records that went to the trash together with
-+// the provided one, aka. the ones reachable through the "cascade delete"
-+// relations that carry its exact trash timestamp.
-+//
-+// The records that were trashed on their own carry a different timestamp and
-+// are therefore left out.
++// The timestamp is what the group is: one delete stamps everything it trashes
++// with the same value and no other delete may reuse that value, so the group
++// is whatever the trash holds under it. Rebuilding the group by walking the
++// cascade relations instead would answer from the schema as it stands today,
++// and a relation that stopped cascading after the delete would quietly leave
++// members behind, still carrying a stamp they are no longer found by.
 +//
 +// The group is returned as a whole rather than restored on the way, because a
 +// member can cascade-depend on another member that hasn't been reached yet and
 +// the two are only valid together.
 +func collectRestoreGroup(app App, mainRecord *Record, trashedAt types.DateTime) ([]*Record, error) {
-+	group := []*Record{mainRecord}
-+	seen := map[string]bool{
-+		restoreGroupKey(mainRecord.Collection().Id, mainRecord.Id): true,
++	collections, err := app.FindAllCollections(CollectionTypeBase)
++	if err != nil {
++		return nil, err
 +	}
 +
-+	// the slice is appended to while it is walked so that the members pulled
-+	// in by a member are visited as well
-+	for i := 0; i < len(group); i++ {
-+		current := group[i]
++	group := []*Record{mainRecord}
++	mainKey := restoreGroupKey(mainRecord.Collection().Id, mainRecord.Id)
 +
-+		// the records the current one followed into the trash
-+		// -------------------------------------------------------
-+		// walking only the incoming references would make the group depend on
-+		// where the restore starts: a cascade child would collect nothing and
-+		// then be blocked by its own still trashed parent. Following the
-+		// cascade relations in both directions makes the group the same set
-+		// from any of its members.
-+		if err := collectCascadeTargets(app, current, trashedAt, seen, &group); err != nil {
-+			return nil, err
++	for _, collection := range collections {
++		if !collection.IsSoftDeleteEnabled() {
++			continue
 +		}
 +
-+		refs, err := app.FindCachedCollectionReferences(current.Collection())
++		tableName := inflector.Columnify(collection.Name)
++		idColumn := tableName + ".id"
++
++		err := eachRecordId(
++			idColumn,
++			func(cursor string) *dbx.SelectQuery {
++				return app.DB().
++					Select(idColumn).
++					From(tableName).
++					AndWhere(dbx.HashExp{tableName + "." + FieldNameDeleted: trashedAt.String()}).
++					AndWhere(dbx.NewExp("[["+idColumn+"]] > {:cursor}", dbx.Params{"cursor": cursor}))
++			},
++			func(id string) error {
++				if restoreGroupKey(collection.Id, id) == mainKey {
++					return nil // the record the restore started from
++				}
++
++				record, err := app.FindTrashedRecordById(collection, id)
++				if err != nil {
++					if errors.Is(err, sql.ErrNoRows) {
++						return nil // restored or purged in the meantime
++					}
++					return err
++				}
++
++				group = append(group, record)
++
++				return nil
++			},
++		)
 +		if err != nil {
 +			return nil, err
-+		}
-+
-+		for _, refCollection := range sortedRefCollections(refs) {
-+			if refCollection.IsView() || !refCollection.IsSoftDeleteEnabled() {
-+				continue
-+			}
-+
-+			for _, field := range refs[refCollection] {
-+				relField, ok := field.(*RelationField)
-+				if !ok || !relField.CascadeDelete {
-+					continue
-+				}
-+
-+				refTableName := inflector.Columnify(refCollection.Name)
-+				idColumn := refTableName + ".id"
-+
-+				err := eachReferencingRecordId(
-+					idColumn,
-+					func(cursor string) *dbx.SelectQuery {
-+						return referencingRecordIdsQuery(app, current, refCollection, field).
-+							AndWhere(dbx.HashExp{refTableName + "." + FieldNameDeleted: trashedAt.String()}).
-+							AndWhere(dbx.NewExp("[["+idColumn+"]] > {:cursor}", dbx.Params{"cursor": cursor}))
-+					},
-+					func(refId string) error {
-+						key := restoreGroupKey(refCollection.Id, refId)
-+						if seen[key] {
-+							return nil // already collected, which also breaks the eventual cycles
-+						}
-+
-+						refRecord, err := app.FindTrashedRecordById(refCollection, refId)
-+						if err != nil {
-+							if errors.Is(err, sql.ErrNoRows) {
-+								return nil
-+							}
-+							return err
-+						}
-+
-+						seen[key] = true
-+						group = append(group, refRecord)
-+
-+						return nil
-+					},
-+				)
-+				if err != nil {
-+					return nil, err
-+				}
-+			}
 +		}
 +	}
 +
