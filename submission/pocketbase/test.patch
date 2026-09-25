@@ -1187,10 +1187,10 @@ index 0000000..fab43d3
 +}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..53dfb58
+index 0000000..566f833
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,2579 @@
+@@ -0,0 +1,2606 @@
 +package softdeletetests
 +
 +import (
@@ -1602,6 +1602,33 @@ index 0000000..53dfb58
 +
 +	if sdRawExists(t, app, posts, record.Id) {
 +		t.Fatal("expected the record row to be removed")
++	}
++}
++
++func TestSoftDeleteTruncateEmptiesTheTableIncludingTheTrash(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	live := sdNewRecord(t, app, posts, map[string]any{"title": "live"})
++	trashed := sdNewRecord(t, app, posts, map[string]any{"title": "trashed"})
++
++	if err := app.Delete(trashed); err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.TruncateCollection(posts); err != nil {
++		t.Fatal(err)
++	}
++
++	// truncating is a bulk delete, not a bulk trash: the rows it was asked to
++	// remove cannot be left in the table, whichever side of the trash they
++	// were on when it was called
++	for label, id := range map[string]string{"live": live.Id, "trashed": trashed.Id} {
++		if sdRawExists(t, app, posts, id) {
++			t.Fatalf("expected the %s row to be removed", label)
++		}
 +	}
 +}
 +
