@@ -329,10 +329,10 @@ index 0000000..5623cef
 +}
 diff --git a/softdeletetests/api_soft_delete_280aff_test.go b/softdeletetests/api_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..61e13bb
+index 0000000..fab43d3
 --- /dev/null
 +++ b/softdeletetests/api_soft_delete_280aff_test.go
-@@ -0,0 +1,789 @@
+@@ -0,0 +1,852 @@
 +package softdeletetests
 +
 +import (
@@ -1122,17 +1122,81 @@ index 0000000..61e13bb
 +		scenario.Test(t)
 +	}
 +}
++
++func TestSoftDeleteRejectsEveryUnknownTrashedValue(t *testing.T) {
++	// one rejected token could be special cased; a handful cannot
++	for _, value := range []string{"yes", "no", "1", "all", "trashed", "none"} {
++		scenario := tests.ApiScenario{
++			Name:           "the list route rejects trashed=" + value,
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records?trashed=" + value,
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 400,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		}
++		scenario.Test(t)
++
++		view := tests.ApiScenario{
++			Name:           "the view route rejects trashed=" + value,
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId + "?trashed=" + value,
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 400,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++		}
++		view.Test(t)
++
++		// ... and a collection without the mode ignores every one of them
++		ignored := tests.ApiScenario{
++			Name:           "a regular collection ignores trashed=" + value,
++			Method:         http.MethodGet,
++			URL:            "/api/collections/sd_api_plain/records?trashed=" + value,
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"id":"` + sdPlainRecordId + `"`,
++			},
++		}
++		ignored.Test(t)
++	}
++}
++
++func TestSoftDeleteRejectsEveryNonBooleanPurgeValue(t *testing.T) {
++	for _, value := range []string{"maybe", "yes", "2", "on", "purge"} {
++		scenario := tests.ApiScenario{
++			Name:           "the delete route rejects purge=" + value,
++			Method:         http.MethodDelete,
++			URL:            "/api/collections/sd_api_posts/records/" + sdLiveRecordId + "?purge=" + value,
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 400,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				if _, err := app.FindRecordById("sd_api_posts", sdLiveRecordId); err != nil {
++					t.Fatalf("expected the record to be untouched, got %v", err)
++				}
++			},
++		}
++		scenario.Test(t)
++	}
++}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..3355e1a
+index 0000000..b9cc81f
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,2433 @@
+@@ -0,0 +1,2546 @@
 +package softdeletetests
 +
 +import (
 +	"database/sql"
 +	"errors"
++	"fmt"
 +	"slices"
 +	"strings"
 +	"testing"
@@ -3559,6 +3623,118 @@ index 0000000..3355e1a
 +
 +	if restored.IsTrashed() || !restored.TrashedAt().IsZero() {
 +		t.Fatalf("expected a restored record to report no trash time, got %q", restored.TrashedAt().String())
++	}
++}
++
++func TestSoftDeleteRapidDeletesAllGetDistinctTimestamps(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, _, _ := sdSetup(t, app)
++
++	titles := []string{"one", "two", "three", "four", "five", "six"}
++
++	records := make([]*core.Record, 0, len(titles))
++	for _, title := range titles {
++		records = append(records, sdNewRecord(t, app, posts, map[string]any{"title": title}))
++	}
++
++	// back to back, so anything that only alternates between two stamps or
++	// leans on the clock ticking between calls shows up here
++	for _, record := range records {
++		if err := app.Delete(record); err != nil {
++			t.Fatal(err)
++		}
++	}
++
++	seen := map[string]string{}
++
++	for _, record := range records {
++		trashed, err := app.FindTrashedRecordById(posts, record.Id)
++		if err != nil {
++			t.Fatal(err)
++		}
++
++		stamp := trashed.TrashedAt().String()
++		if other, ok := seen[stamp]; ok {
++			t.Fatalf("expected every delete to get its own timestamp, %q and %q share %q", other, record.Id, stamp)
++		}
++
++		seen[stamp] = record.Id
++	}
++
++	if len(seen) != len(records) {
++		t.Fatalf("expected %d distinct timestamps, got %d", len(records), len(seen))
++	}
++}
++
++func TestSoftDeleteRestoreStartsFromAnyMemberOfEitherShape(t *testing.T) {
++	// a chain, where each level depends on the one above it, and a star,
++	// where two dependents hang off one record; the restore has to work from
++	// every member of either
++	shapes := []struct {
++		name  string
++		build func(t *testing.T, app core.App) (*core.Record, []*core.Record)
++	}{
++		{
++			name: "chain",
++			build: func(t *testing.T, app core.App) (*core.Record, []*core.Record) {
++				root, middle, child := sdDependencyChain(t, app)
++
++				rootRecord := sdNewRecord(t, app, root, map[string]any{"title": "root"})
++				middleRecord := sdNewRecord(t, app, middle, map[string]any{"root": rootRecord.Id})
++				childRecord := sdNewRecord(t, app, child, map[string]any{
++					"root":   rootRecord.Id,
++					"middle": middleRecord.Id,
++				})
++
++				return rootRecord, []*core.Record{rootRecord, middleRecord, childRecord}
++			},
++		},
++		{
++			name: "star",
++			build: func(t *testing.T, app core.App) (*core.Record, []*core.Record) {
++				posts, comments, _ := sdSetup(t, app)
++
++				post := sdNewRecord(t, app, posts, map[string]any{"title": "star"})
++				first := sdNewRecord(t, app, comments, map[string]any{"message": "one", "post": post.Id})
++				second := sdNewRecord(t, app, comments, map[string]any{"message": "two", "post": post.Id})
++
++				return post, []*core.Record{post, first, second}
++			},
++		},
++	}
++
++	for _, shape := range shapes {
++		for position := range 3 {
++			t.Run(fmt.Sprintf("%s from position %d", shape.name, position), func(t *testing.T) {
++				app, _ := tests.NewTestApp()
++				defer app.Cleanup()
++
++				deleteFrom, members := shape.build(t, app)
++
++				if err := app.Delete(deleteFrom); err != nil {
++					t.Fatal(err)
++				}
++
++				start := members[position]
++
++				trashed, err := app.FindTrashedRecordById(start.Collection(), start.Id)
++				if err != nil {
++					t.Fatalf("expected every member to be in the trash, got %v", err)
++				}
++
++				if err := app.RestoreRecord(trashed); err != nil {
++					t.Fatalf("expected the group to restore from this member, got %v", err)
++				}
++
++				for _, member := range members {
++					if _, err := app.FindRecordById(member.Collection(), member.Id); err != nil {
++						t.Fatalf("expected the %s record to come back, got %v", member.Collection().Name, err)
++					}
++				}
++			})
++		}
 +	}
 +}
 diff --git a/test.sh b/test.sh
