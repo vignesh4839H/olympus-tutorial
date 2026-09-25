@@ -1301,10 +1301,10 @@ index 0000000..58e1c3e
 +}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..f2d288b
+index 0000000..77246a8
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,2656 @@
+@@ -0,0 +1,2708 @@
 +package softdeletetests
 +
 +import (
@@ -2658,6 +2658,58 @@ index 0000000..f2d288b
 +
 +	if len(records) != 0 {
 +		t.Fatalf("expected no matches once the post is trashed, got %v", sdFindIds(t, records))
++	}
++}
++
++func TestSoftDeleteClearedStampCannotReviveAStandaloneRecord(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	// a collection that points nowhere, so nothing but the record's own trash
++	// state can refuse the save. The cascade variant below cannot tell the two
++	// apart: a parent still in the trash rejects it through the relation
++	collection := core.NewBaseCollection("sd_standalone_save")
++	collection.SoftDelete = true
++	collection.Fields.Add(&core.TextField{Name: "message"})
++	if err := app.Save(collection); err != nil {
++		t.Fatal(err)
++	}
++
++	record := sdNewRecord(t, app, collection, map[string]any{"message": "trashed"})
++
++	if err := app.Delete(record); err != nil {
++		t.Fatal(err)
++	}
++
++	trashed, err := app.FindTrashedRecordById(collection, record.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	// the stamp is the caller's to edit and the row's to keep: clearing one
++	// must not move the other
++	trashed.Set(core.FieldNameDeleted, "")
++	trashed.Set("message", "sneaked back")
++
++	if err := app.Save(trashed); err == nil {
++		t.Fatal("expected an ordinary save to be refused for a trashed record")
++	}
++
++	if _, err := app.FindRecordById(collection, record.Id); !errors.Is(err, sql.ErrNoRows) {
++		t.Fatalf("expected the record to stay in the trash, got %v", err)
++	}
++
++	reloaded, err := app.FindTrashedRecordById(collection, record.Id)
++	if err != nil {
++		t.Fatalf("expected the record to still be in the trash: %v", err)
++	}
++
++	if !reloaded.IsTrashed() {
++		t.Fatal("expected the persisted record to still read as trashed")
++	}
++
++	if reloaded.GetString("message") != "trashed" {
++		t.Fatalf("expected the message to be unchanged, got %q", reloaded.GetString("message"))
 +	}
 +}
 +
