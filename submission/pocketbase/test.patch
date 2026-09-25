@@ -3799,10 +3799,10 @@ index 0000000..566f833
 +}
 diff --git a/test.sh b/test.sh
 new file mode 100755
-index 0000000..9dcd471
+index 0000000..3346e3b
 --- /dev/null
 +++ b/test.sh
-@@ -0,0 +1,133 @@
+@@ -0,0 +1,153 @@
 +#!/usr/bin/env bash
 +#
 +# Usage:
@@ -3829,6 +3829,24 @@ index 0000000..9dcd471
 +
 +MODE="${1:-new}"
 +
++# base mode deselects a handful of tests with "go test -skip", which Go has
++# accepted since 1.20. That is not a real constraint here: go.mod requires
++# go 1.27, so no toolchain able to build this module is old enough to lack
++# the flag, and the image sets GOTOOLCHAIN=auto so the required one is
++# fetched. The check below says so out loud instead of assuming it, and
++# stays quiet for a toolchain whose version it cannot parse.
++require_skip_support() {
++  local version minor
++
++  version="$(go env GOVERSION 2>/dev/null || true)"
++  minor="$(printf '%s' "$version" | sed -n 's/^go1\.\([0-9]\{1,\}\).*/\1/p')"
++
++  if [ -n "$minor" ] && [ "$minor" -lt 20 ]; then
++    echo "base mode needs Go 1.20 or newer for \"go test -skip\" (found $version)" >&2
++    exit 2
++  fi
++}
++
 +# every dependency is in the module cache after the image build, so refuse to
 +# reach out for anything at test time
 +export GOPROXY=off
@@ -3841,6 +3859,8 @@ index 0000000..9dcd471
 +
 +case "$MODE" in
 +  base)
++    require_skip_support
++
 +    # the suites of the packages the change touches are the regression gate, so
 +    # they run in full; the soft delete tests live in their own package and are
 +    # not part of it
