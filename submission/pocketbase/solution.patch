@@ -535,23 +535,25 @@ index 3d0f41c..b112abc 100644
  	app.Cron().Add("__pbLogsCleanup__", "0 */6 * * *", func() {
  		deleteErr := app.DeleteOldLogs(time.Now().AddDate(0, 0, -1*app.Settings().Logs.MaxDays))
 diff --git a/core/collection_import.go b/core/collection_import.go
-index e169a55..60c8e3e 100644
+index e169a55..9eb6097 100644
 --- a/core/collection_import.go
 +++ b/core/collection_import.go
-@@ -167,6 +167,11 @@ func (app *BaseApp) ImportCollections(toImport []map[string]any, deleteMissing b
+@@ -167,6 +167,13 @@ func (app *BaseApp) ImportCollections(toImport []map[string]any, deleteMissing b
  
  		// upsert imported collections
  		for _, imported := range importedCollections {
 +			// an enabled collection serializes its generated "deleted" field
 +			// along with the option, so an import is allowed to bring that
-+			// field back rather than colliding with it
-+			imported.adoptGeneratedDeletedField()
++			// field back rather than colliding with it - but only where the
++			// stored collection does not already have a "deleted" field of its
++			// own, which the import would otherwise take over
++			imported.adoptGeneratedDeletedField(mappedExisting[imported.Id])
 +
  			if err := txApp.SaveNoValidate(imported); err != nil {
  				return fmt.Errorf("failed to save collection %q: %w", imported.Name, err)
  			}
 diff --git a/core/collection_model.go b/core/collection_model.go
-index 2ed040a..f00dd2b 100644
+index 2ed040a..624eac2 100644
 --- a/core/collection_model.go
 +++ b/core/collection_model.go
 @@ -3,6 +3,7 @@ package core
@@ -680,7 +682,7 @@ index 2ed040a..f00dd2b 100644
  	case CollectionTypeAuth:
  		c.initIdField()
  		c.initPasswordField()
-@@ -983,6 +1044,187 @@ func (c *Collection) initIdField() {
+@@ -983,6 +1044,203 @@ func (c *Collection) initIdField() {
  	}
  }
  
@@ -693,8 +695,24 @@ index 2ed040a..f00dd2b 100644
 +// bring that field back, while a caller going through the ordinary save path
 +// never reaches here and still gets the name refused. Only this mode's own
 +// shape is adopted; any other field of that name keeps conflicting.
-+func (c *Collection) adoptGeneratedDeletedField() {
++//
++// persisted is the collection as the database holds it, or nil when the import
++// creates it. It decides whether the field on the import is this mode's to
++// claim: a snapshot cannot say where the field of a collection that already
++// exists came from, so the answer has to come from what is already stored.
++func (c *Collection) adoptGeneratedDeletedField(persisted *Collection) {
 +	if !c.IsBase() || !c.SoftDelete {
++		return
++	}
++
++	// a stored collection that has the name without the mode owns it, and an
++	// import that turns the mode on is the enable the refusal is written for.
++	// Adopting here would hand this mode a field somebody else created and
++	// quietly restamp it as generated, so the field stays theirs and the save
++	// is left to refuse the transition
++	if persisted != nil &&
++		!persisted.IsSoftDeleteEnabled() &&
++		persisted.Fields.GetByName(FieldNameDeleted) != nil {
 +		return
 +	}
 +
