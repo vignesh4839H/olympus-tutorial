@@ -1187,17 +1187,16 @@ index 0000000..fab43d3
 +}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..b9cc81f
+index 0000000..f3cec0c
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,2546 @@
+@@ -0,0 +1,2556 @@
 +package softdeletetests
 +
 +import (
 +	"database/sql"
 +	"errors"
 +	"fmt"
-+	"slices"
 +	"strings"
 +	"testing"
 +	"time"
@@ -1280,6 +1279,17 @@ index 0000000..b9cc81f
 +	}
 +
 +	return total > 0
++}
++
++// sdContains reports whether the slice holds the value.
++func sdContains(values []string, want string) bool {
++	for _, value := range values {
++		if value == want {
++			return true
++		}
++	}
++
++	return false
 +}
 +
 +func sdFindIds(t testing.TB, records []*core.Record) []string {
@@ -3095,7 +3105,7 @@ index 0000000..b9cc81f
 +		}
 +
 +		for _, want := range []string{first.Id, second.Id} {
-+			if !slices.Contains(stored, want) {
++			if !sdContains(stored, want) {
 +				t.Fatalf("%s: expected %q to still be stored, got %v", label, want, stored)
 +			}
 +		}
@@ -3706,7 +3716,7 @@ index 0000000..b9cc81f
 +	}
 +
 +	for _, shape := range shapes {
-+		for position := range 3 {
++		for position := 0; position < 3; position++ {
 +			t.Run(fmt.Sprintf("%s from position %d", shape.name, position), func(t *testing.T) {
 +				app, _ := tests.NewTestApp()
 +				defer app.Cleanup()
