@@ -329,10 +329,10 @@ index 0000000..5623cef
 +}
 diff --git a/softdeletetests/api_soft_delete_280aff_test.go b/softdeletetests/api_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..fab43d3
+index 0000000..ed56842
 --- /dev/null
 +++ b/softdeletetests/api_soft_delete_280aff_test.go
-@@ -0,0 +1,852 @@
+@@ -0,0 +1,881 @@
 +package softdeletetests
 +
 +import (
@@ -816,6 +816,32 @@ index 0000000..fab43d3
 +			},
 +		},
 +		{
++			Name:   "an empty before value is rejected instead of emptying the trash",
++			Method: http.MethodDelete,
++			URL:    "/api/collections/sd_api_posts/trash?before=",
++			Headers: map[string]string{
++				"Authorization": sdSuperuserToken,
++			},
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 400,
++			ExpectedContent: []string{
++				`"data":`,
++			},
++			AfterTestFunc: func(t testing.TB, app *tests.TestApp, res *http.Response) {
++				// the cutoff the value would have fallen back to is the one
++				// that takes everything, so a rejection has to leave the
++				// trash exactly as it was
++				trashed, err := app.FindAllTrashedRecords("sd_api_posts")
++				if err != nil {
++					t.Fatal(err)
++				}
++
++				if len(trashed) == 0 {
++					t.Fatal("expected the trash to be left alone")
++				}
++			},
++		},
++		{
 +			Name:   "emptying the trash of a regular collection is rejected",
 +			Method: http.MethodDelete,
 +			URL:    "/api/collections/sd_api_plain/trash",
@@ -1124,8 +1150,10 @@ index 0000000..fab43d3
 +}
 +
 +func TestSoftDeleteRejectsEveryUnknownTrashedValue(t *testing.T) {
-+	// one rejected token could be special cased; a handful cannot
-+	for _, value := range []string{"yes", "no", "1", "all", "trashed", "none"} {
++	// one rejected token could be special cased; a handful cannot. The empty
++	// one belongs in the list because a parameter sent with nothing after the
++	// "=" still names a mode, and not one of the two the routes take
++	for _, value := range []string{"yes", "no", "1", "all", "trashed", "none", ""} {
 +		scenario := tests.ApiScenario{
 +			Name:           "the list route rejects trashed=" + value,
 +			Method:         http.MethodGet,
@@ -1166,7 +1194,8 @@ index 0000000..fab43d3
 +}
 +
 +func TestSoftDeleteRejectsEveryNonBooleanPurgeValue(t *testing.T) {
-+	for _, value := range []string{"maybe", "yes", "2", "on", "purge"} {
++	// the empty value is one of them: "purge=" was sent, and it is not a boolean
++	for _, value := range []string{"maybe", "yes", "2", "on", "purge", ""} {
 +		scenario := tests.ApiScenario{
 +			Name:           "the delete route rejects purge=" + value,
 +			Method:         http.MethodDelete,
@@ -1187,10 +1216,10 @@ index 0000000..fab43d3
 +}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..566f833
+index 0000000..f2d288b
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,2606 @@
+@@ -0,0 +1,2656 @@
 +package softdeletetests
 +
 +import (
@@ -2093,6 +2122,56 @@ index 0000000..566f833
 +			"expected two separate deletes to use different trash timestamps, got %q for both",
 +			trashedFirst.TrashedAt().String(),
 +		)
++	}
++}
++
++func TestSoftDeleteBackRelationFilterHidesTrashed(t *testing.T) {
++	app, _ := tests.NewTestApp()
++	defer app.Cleanup()
++
++	posts, comments, _ := sdSetup(t, app)
++
++	post := sdNewRecord(t, app, posts, map[string]any{"title": "found through its comments"})
++	comment := sdNewRecord(t, app, comments, map[string]any{"message": "hidden", "post": post.Id})
++
++	// a back relation reached from the filter rather than from an expand,
++	// which resolves through a join of its own
++	const filter = "sd_comments_via_post.message = 'hidden'"
++
++	matches := func(label string) int {
++		t.Helper()
++
++		found, err := app.FindRecordsByFilter(posts, filter, "", 0, 0)
++		if err != nil {
++			t.Fatalf("%s: %v", label, err)
++		}
++
++		return len(found)
++	}
++
++	if total := matches("before"); total != 1 {
++		t.Fatalf("expected the post to match while the comment is live, got %d", total)
++	}
++
++	if err := app.Delete(comment); err != nil {
++		t.Fatal(err)
++	}
++
++	if total := matches("after the comment is trashed"); total != 0 {
++		t.Fatalf("expected the trashed comment to stop matching, got %d", total)
++	}
++
++	trashedComment, err := app.FindTrashedRecordById(comments, comment.Id)
++	if err != nil {
++		t.Fatal(err)
++	}
++
++	if err := app.RestoreRecord(trashedComment); err != nil {
++		t.Fatal(err)
++	}
++
++	if total := matches("after the comment is restored"); total != 1 {
++		t.Fatalf("expected the restored comment to match again, got %d", total)
 +	}
 +}
 +

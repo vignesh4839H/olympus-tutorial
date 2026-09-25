@@ -73,7 +73,7 @@ index d6d8b58..fbda95d 100644
  // to be performed against different db app context (e.g. out of a transaction).
  // If set, it is expected that optAccessCheckApp instance is used for read-only operations to avoid deadlocks.
 diff --git a/apis/record_crud.go b/apis/record_crud.go
-index 3a35e93..c2479b0 100644
+index 3a35e93..6a71113 100644
 --- a/apis/record_crud.go
 +++ b/apis/record_crud.go
 @@ -6,6 +6,7 @@ import (
@@ -92,7 +92,7 @@ index 3a35e93..c2479b0 100644
  )
  
  // bindRecordCrudApi registers the record crud api endpoints and
-@@ -31,6 +33,114 @@ func bindRecordCrudApi(app core.App, rg *router.RouterGroup[*core.RequestEvent])
+@@ -31,6 +33,126 @@ func bindRecordCrudApi(app core.App, rg *router.RouterGroup[*core.RequestEvent])
  	subGroup.POST("", recordCreate(true, nil)).Bind(dynamicCollectionBodyLimit(""))
  	subGroup.PATCH("/{id}", recordUpdate(true, nil)).Bind(dynamicCollectionBodyLimit(""))
  	subGroup.DELETE("/{id}", recordDelete(true, nil))
@@ -121,8 +121,11 @@ index 3a35e93..c2479b0 100644
 +	// the zero value purges the entire trash
 +	var before types.DateTime
 +
-+	if raw := e.Request.URL.Query().Get("before"); raw != "" {
-+		parsed, parseErr := types.ParseDateTime(raw)
++	// a sent parameter is validated even when it carries nothing, because
++	// the two cases ask for opposite things: an absent one empties the whole
++	// trash, while an empty one is a datetime that cannot be read
++	if query := e.Request.URL.Query(); query.Has("before") {
++		parsed, parseErr := types.ParseDateTime(query.Get("before"))
 +		if parseErr != nil || parsed.IsZero() {
 +			return e.BadRequestError(`Invalid "before" query parameter value - must be a valid datetime.`, parseErr)
 +		}
@@ -160,10 +163,17 @@ index 3a35e93..c2479b0 100644
 +		return trashedModeNone, nil
 +	}
 +
-+	mode := e.Request.URL.Query().Get("trashed")
++	// not asking is the only way to get the default: a sent parameter names a
++	// mode, and an empty one names none of them
++	query := e.Request.URL.Query()
++	if !query.Has("trashed") {
++		return trashedModeNone, nil
++	}
++
++	mode := query.Get("trashed")
 +
 +	switch mode {
-+	case trashedModeNone, trashedModeWith, trashedModeOnly:
++	case trashedModeWith, trashedModeOnly:
 +		// supported
 +	default:
 +		return "", e.BadRequestError(`Invalid "trashed" query parameter value - must be "with" or "only".`, nil)
@@ -174,12 +184,14 @@ index 3a35e93..c2479b0 100644
 +
 +// resolvePurgeParam reads and validates the "purge" delete query parameter.
 +func resolvePurgeParam(e *core.RequestEvent) (bool, error) {
-+	raw := e.Request.URL.Query().Get("purge")
-+	if raw == "" {
++	// only an absent parameter falls back to the ordinary delete; anything
++	// that was sent has to read as a boolean, the empty value included
++	query := e.Request.URL.Query()
++	if !query.Has("purge") {
 +		return false, nil
 +	}
 +
-+	purge, err := strconv.ParseBool(raw)
++	purge, err := strconv.ParseBool(query.Get("purge"))
 +	if err != nil {
 +		return false, e.BadRequestError(`Invalid "purge" query parameter value - must be a boolean.`, err)
 +	}
@@ -207,7 +219,7 @@ index 3a35e93..c2479b0 100644
  }
  
  func recordsList(e *core.RequestEvent) error {
-@@ -59,7 +169,20 @@ func recordsList(e *core.RequestEvent) error {
+@@ -59,7 +181,20 @@ func recordsList(e *core.RequestEvent) error {
  		return err
  	}
  
@@ -229,7 +241,7 @@ index 3a35e93..c2479b0 100644
  
  	fieldsResolver := core.NewRecordFieldResolver(e.App, collection, requestInfo, true)
  
-@@ -185,7 +308,12 @@ func recordView(e *core.RequestEvent) error {
+@@ -185,7 +320,12 @@ func recordView(e *core.RequestEvent) error {
  		return nil
  	}
  
@@ -243,7 +255,7 @@ index 3a35e93..c2479b0 100644
  	if fetchErr != nil || record == nil {
  		return firstApiError(err, e.NotFoundError("", fetchErr))
  	}
-@@ -577,7 +705,18 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
+@@ -577,7 +717,18 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
  			return nil
  		}
  
@@ -263,7 +275,7 @@ index 3a35e93..c2479b0 100644
  		if err != nil || record == nil {
  			return e.NotFoundError("", err)
  		}
-@@ -590,8 +729,14 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
+@@ -590,8 +741,14 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
  		event.Record = record
  
  		hookErr := e.App.OnRecordDeleteRequest().Trigger(event, func(e *core.RecordRequestEvent) error {
@@ -280,7 +292,7 @@ index 3a35e93..c2479b0 100644
  			}
  
  			err = execAfterSuccessTx(responseWriteAfterTx, e.App, func() error {
-@@ -626,6 +771,111 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
+@@ -626,6 +783,111 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
  	}
  }
  
