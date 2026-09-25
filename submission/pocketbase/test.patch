@@ -1187,10 +1187,10 @@ index 0000000..fab43d3
 +}
 diff --git a/softdeletetests/core_soft_delete_280aff_test.go b/softdeletetests/core_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..f3cec0c
+index 0000000..53dfb58
 --- /dev/null
 +++ b/softdeletetests/core_soft_delete_280aff_test.go
-@@ -0,0 +1,2556 @@
+@@ -0,0 +1,2579 @@
 +package softdeletetests
 +
 +import (
@@ -2297,7 +2297,7 @@ index 0000000..f3cec0c
 +		t.Fatal(err)
 +	}
 +
-+	t.Run("turning the mode off keeps every row", func(t *testing.T) {
++	t.Run("turning the mode off keeps every row and frees the trashed one", func(t *testing.T) {
 +		posts.SoftDelete = false
 +		if err := app.Save(posts); err != nil {
 +			t.Fatal(err)
@@ -2310,6 +2310,29 @@ index 0000000..f3cec0c
 +
 +		if len(records) != 2 {
 +			t.Fatalf("expected both records to be visible, got %v", sdFindIds(t, records))
++		}
++
++		// the generated field goes with the mode
++		if field := posts.Fields.GetByName(core.FieldNameDeleted); field != nil {
++			t.Fatalf("expected the generated field to be gone, got %v", field)
++		}
++
++		// ... and without it the record that was in the trash is an ordinary
++		// live one: an ordinary read finds it, and it no longer answers that
++		// it is trashed or when it was trashed
++		for _, id := range []string{live.Id, trashed.Id} {
++			reloaded, err := app.FindRecordById(posts, id)
++			if err != nil {
++				t.Fatalf("expected %q to be readable, got %v", id, err)
++			}
++
++			if reloaded.IsTrashed() {
++				t.Fatalf("expected %q to read as live, got a trashed record", id)
++			}
++
++			if at := reloaded.TrashedAt(); !at.IsZero() {
++				t.Fatalf("expected %q to carry no trash timestamp, got %q", id, at.String())
++			}
 +		}
 +	})
 +
