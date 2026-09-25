@@ -329,14 +329,15 @@ index 0000000..5623cef
 +}
 diff --git a/softdeletetests/api_soft_delete_280aff_test.go b/softdeletetests/api_soft_delete_280aff_test.go
 new file mode 100644
-index 0000000..ed56842
+index 0000000..58e1c3e
 --- /dev/null
 +++ b/softdeletetests/api_soft_delete_280aff_test.go
-@@ -0,0 +1,881 @@
+@@ -0,0 +1,966 @@
 +package softdeletetests
 +
 +import (
 +	"net/http"
++	"net/url"
 +	"strings"
 +	"testing"
 +
@@ -351,6 +352,9 @@ index 0000000..ed56842
 +	sdLiveRecordId    = "sdapilive000001"
 +	sdTrashedRecordId = "sdapitrashed001"
 +	sdPlainRecordId   = "sdapiplain00001"
++
++	sdCommentOnLiveId    = "sdapiclive00001"
++	sdCommentOnTrashedId = "sdapictrash0001"
 +)
 +
 +// sdApiSetup creates a public soft delete enabled collection holding one live
@@ -383,6 +387,21 @@ index 0000000..ed56842
 +		t.Fatalf("failed to save sd_api_plain: %v", err)
 +	}
 +
++	comments := core.NewBaseCollection("sd_api_comments")
++	comments.Fields.Add(&core.TextField{Name: "message"})
++	comments.Fields.Add(&core.RelationField{
++		Name:         "post",
++		CollectionId: posts.Id,
++	})
++	comments.ListRule = &publicRule
++	comments.ViewRule = &publicRule
++	comments.CreateRule = &publicRule
++	comments.UpdateRule = &publicRule
++	comments.DeleteRule = &publicRule
++	if err := app.Save(comments); err != nil {
++		t.Fatalf("failed to save sd_api_comments: %v", err)
++	}
++
 +	live := core.NewRecord(posts)
 +	live.Id = sdLiveRecordId
 +	live.Set("title", "live one")
@@ -396,6 +415,22 @@ index 0000000..ed56842
 +	if err := app.Save(trashed); err != nil {
 +		t.Fatalf("failed to save the trashed record: %v", err)
 +	}
++
++	// the comments are written while both posts are live, so the one pointing
++	// at the trashed post keeps a value that only the reads have to hide
++	for id, target := range map[string]string{
++		sdCommentOnLiveId:    sdLiveRecordId,
++		sdCommentOnTrashedId: sdTrashedRecordId,
++	} {
++		comment := core.NewRecord(comments)
++		comment.Id = id
++		comment.Set("message", "comment on "+target)
++		comment.Set("post", target)
++		if err := app.Save(comment); err != nil {
++			t.Fatalf("failed to save the comment %q: %v", id, err)
++		}
++	}
++
 +	if err := app.Delete(trashed); err != nil {
 +		t.Fatalf("failed to trash the record: %v", err)
 +	}
@@ -1211,6 +1246,56 @@ index 0000000..ed56842
 +				}
 +			},
 +		}
++		scenario.Test(t)
++	}
++}
++
++func TestSoftDeleteListApiFilterHidesTrashedRelations(t *testing.T) {
++	listURL := func(filter string) string {
++		return "/api/collections/sd_api_comments/records?filter=" + url.QueryEscape(filter)
++	}
++
++	scenarios := []tests.ApiScenario{
++		{
++			// the list route builds its own query through the search provider
++			// rather than going through FindRecordsByFilter, so the exclusion
++			// has to hold on that surface too
++			Name:           "a filter reaching a live record still matches",
++			Method:         http.MethodGet,
++			URL:            listURL("post.title = 'live one'"),
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"totalItems":1`,
++				`"id":"` + sdCommentOnLiveId + `"`,
++			},
++		},
++		{
++			Name:           "a filter reaching a trashed record matches nothing",
++			Method:         http.MethodGet,
++			URL:            listURL("post.title = 'trashed one'"),
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"totalItems":0`,
++			},
++			NotExpectedContent: []string{
++				`"id":"` + sdCommentOnTrashedId + `"`,
++			},
++		},
++		{
++			Name:           "the same filter written against the id matches nothing either",
++			Method:         http.MethodGet,
++			URL:            listURL("post.id = '" + sdTrashedRecordId + "'"),
++			BeforeTestFunc: sdBefore,
++			ExpectedStatus: 200,
++			ExpectedContent: []string{
++				`"totalItems":0`,
++			},
++		},
++	}
++
++	for _, scenario := range scenarios {
 +		scenario.Test(t)
 +	}
 +}
