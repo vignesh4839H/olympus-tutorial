@@ -12,10 +12,10 @@ Cascade-delete dependents are trashed recursively. Trashing leaves stored relati
 
 `App.PurgeTrashedRecords` clears records trashed before a `types.DateTime` cutoff (zero purges all) and reports how many went; without `softDelete` it errors. `App.PurgeExpiredTrashedRecords` applies each retention, skipping collections without one, and returns only an error.
 
-List and view take `trashed=with` for live and trashed records, or `trashed=only` for just those. Any other value returns 400; without `softDelete`, ignore it. An empty value counts as sent, here and below.
+List and view take `trashed=with` for live and trashed records, or `trashed=only` for just those. Any other value, an empty one included, returns 400; without `softDelete`, ignore it.
 
-`DELETE /api/collections/{collection}/records/{id}` takes a boolean `purge` (`true` permanently deletes; non-boolean returns 400). Without `purge`, trashed IDs return 404.
+`DELETE /api/collections/{collection}/records/{id}` takes a boolean `purge` (`true` permanently deletes; anything else, empty included, returns 400). Without `purge`, trashed IDs return 404.
 
 `POST /api/collections/{collection}/records/{id}/restore` uses the update rule and returns the restored record (403 if rule is nil, 404 if rule fails or untrashed, 400 without `softDelete`). The batch endpoint allows it too.
 
-`DELETE /api/collections/{collection}/trash` requires superuser access (401 for guests), takes an optional `before` datetime, rejecting an unparsable one with 400 rather than reading it as absent, returns the count under `purged`, and errors with 400 without `softDelete`.
+`DELETE /api/collections/{collection}/trash` requires superuser access (401 for guests), takes an optional `before` datetime, rejecting an unparsable or empty one with 400 rather than reading it as absent, returns the count under `purged`, and errors with 400 without `softDelete`.
