@@ -1,0 +1,38 @@
+
+func TestSoftDeleteTogglingOffDropsEveryDeletedIndex(t *testing.T) {
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	collection := core.NewBaseCollection("sd_many_deleted_idx")
+	collection.Fields.Add(&core.TextField{Name: "title"})
+	collection.Fields.Add(&core.TextField{Name: "status"})
+	collection.SoftDelete = true
+	if err := app.Save(collection); err != nil {
+		t.Fatal(err)
+	}
+
+	// three separate definitions standing on the generated column: dropping
+	// them one by one while walking the same slice would step over one
+	collection.AddIndex("idx_sd_many_a", false, "`title`", "`deleted` = ''")
+	collection.AddIndex("idx_sd_many_b", false, "`status`", "`deleted` = ''")
+	collection.AddIndex("idx_sd_many_c", false, "`deleted`, `title`", "")
+	if err := app.Save(collection); err != nil {
+		t.Fatal(err)
+	}
+
+	collection.SoftDelete = false
+	if err := app.Save(collection); err != nil {
+		t.Fatalf("expected the mode to be turned off, got %v", err)
+	}
+
+	for _, name := range []string{"idx_sd_many_a", "idx_sd_many_b", "idx_sd_many_c"} {
+		if got := collection.GetIndex(name); got != "" {
+			t.Fatalf("expected %s to go with the column, got %q", name, got)
+		}
+	}
+
+	// the column is gone, so the table has to be usable again
+	if _, err := app.FindAllRecords(collection); err != nil {
+		t.Fatalf("expected the collection to stay usable, got %v", err)
+	}
+}
