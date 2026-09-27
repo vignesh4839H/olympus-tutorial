@@ -1,0 +1,3227 @@
+diff --git a/apis/batch.go b/apis/batch.go
+index 3f7367f..c2f7096 100644
+--- a/apis/batch.go
++++ b/apis/batch.go
+@@ -43,8 +43,15 @@ var ValidBatchActions = map[*regexp.Regexp]BatchActionHandlerFunc{
+ 			id = cast.ToString(ir.Body["id"])
+ 		}
+ 		if id != "" {
+-			_, err := app.FindRecordById(params["collection"], id)
+-			if err == nil {
++			existing, err := app.FindRecordByIdWithTrashed(params["collection"], id)
++			if err == nil && existing.IsTrashed() {
++				// the row is still there but is not visible, so neither an
++				// update nor a create could succeed
++				return func(e *core.RequestEvent) error {
++					return e.BadRequestError("The record is in the trash - restore or purge it first.", nil)
++				}
++			}
++			if err == nil && !existing.IsTrashed() {
+ 				// update
+ 				// ---
+ 				params["id"] = id // required for the path value
+@@ -69,6 +76,9 @@ var ValidBatchActions = map[*regexp.Regexp]BatchActionHandlerFunc{
+ 	regexp.MustCompile(`^DELETE /api/collections/(?P<collection>[^\/\?]+)/records/(?P<id>[^\/\?]+)(\?.*)?$`): func(app core.App, ir *core.InternalRequest, params map[string]string, next func(any) error) HandleFunc {
+ 		return recordDelete(false, next)
+ 	},
++	regexp.MustCompile(`^POST /api/collections/(?P<collection>[^\/\?]+)/records/(?P<id>[^\/\?]+)/restore(\?.*)?$`): func(app core.App, ir *core.InternalRequest, params map[string]string, next func(any) error) HandleFunc {
++		return recordRestore(false, next)
++	},
+ }
+ 
+ type BatchRequestResult struct {
+diff --git a/apis/realtime.go b/apis/realtime.go
+index d6d8b58..fbda95d 100644
+--- a/apis/realtime.go
++++ b/apis/realtime.go
+@@ -440,7 +440,14 @@ func bindRealtimeEvents(app core.App) {
+ 		Func: func(e *core.ModelEvent) error {
+ 			record := realtimeResolveRecord(e.App, e.Model, "")
+ 			if record != nil {
+-				err := realtimeBroadcastRecord(e.App, "update", record, false)
++				// the subscribers never received the record while it was in the
++				// trash, so from their point of view a restore creates it
++				action := "update"
++				if isRestoredRecord(e.Context, e.Model) {
++					action = "create"
++				}
++
++				err := realtimeBroadcastRecord(e.App, action, record, false)
+ 				if err != nil {
+ 					app.Logger().Debug(
+ 						"Failed to broadcast record update",
+@@ -587,6 +594,21 @@ type recordData struct {
+ 	Action string `json:"action"`
+ }
+ 
++// isRestoredRecord checks whether the just saved model is a record that was
++// brought back from the trash.
++//
++// It keys off the save operation rather than the record's original data, which
++// is not refreshed after a save and would otherwise keep reporting every later
++// update of the same instance as a restore.
++func isRestoredRecord(ctx context.Context, m core.Model) bool {
++	record, ok := m.(*core.Record)
++	if !ok || !record.Collection().IsSoftDeleteEnabled() {
++		return false
++	}
++
++	return core.IsRestoreOperation(ctx)
++}
++
+ // Note: the optAccessCheckApp is there in case you want the access check
+ // to be performed against different db app context (e.g. out of a transaction).
+ // If set, it is expected that optAccessCheckApp instance is used for read-only operations to avoid deadlocks.
+diff --git a/apis/record_crud.go b/apis/record_crud.go
+index 3a35e93..6a71113 100644
+--- a/apis/record_crud.go
++++ b/apis/record_crud.go
+@@ -6,6 +6,7 @@ import (
+ 	"fmt"
+ 	"math/big"
+ 	"net/http"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -18,6 +19,7 @@ import (
+ 	"github.com/pocketbase/pocketbase/tools/router"
+ 	"github.com/pocketbase/pocketbase/tools/search"
+ 	"github.com/pocketbase/pocketbase/tools/security"
++	"github.com/pocketbase/pocketbase/tools/types"
+ )
+ 
+ // bindRecordCrudApi registers the record crud api endpoints and
+@@ -31,6 +33,126 @@ func bindRecordCrudApi(app core.App, rg *router.RouterGroup[*core.RequestEvent])
+ 	subGroup.POST("", recordCreate(true, nil)).Bind(dynamicCollectionBodyLimit(""))
+ 	subGroup.PATCH("/{id}", recordUpdate(true, nil)).Bind(dynamicCollectionBodyLimit(""))
+ 	subGroup.DELETE("/{id}", recordDelete(true, nil))
++	subGroup.POST("/{id}/restore", recordRestore(true, nil))
++
++	rg.DELETE("/collections/{collection}/trash", recordsPurgeTrash).Bind(RequireSuperuserAuth())
++}
++
++// recordsPurgeTrash permanently deletes the trashed records of the collection.
++//
++// It accepts an optional "before" datetime query parameter to keep the records
++// that were trashed after it.
++//
++// Emptying the trash is a bulk irreversible operation, so unlike the single
++// record purge it is restricted to superusers.
++func recordsPurgeTrash(e *core.RequestEvent) error {
++	collection, err := e.App.FindCachedCollectionByNameOrId(e.Request.PathValue("collection"))
++	if err != nil || collection == nil {
++		return e.NotFoundError("Missing collection context.", err)
++	}
++
++	if !collection.IsSoftDeleteEnabled() {
++		return e.BadRequestError("The collection doesn't have the soft delete mode enabled.", nil)
++	}
++
++	// the zero value purges the entire trash
++	var before types.DateTime
++
++	// a sent parameter is validated even when it carries nothing, because
++	// the two cases ask for opposite things: an absent one empties the whole
++	// trash, while an empty one is a datetime that cannot be read
++	if query := e.Request.URL.Query(); query.Has("before") {
++		parsed, parseErr := types.ParseDateTime(query.Get("before"))
++		if parseErr != nil || parsed.IsZero() {
++			return e.BadRequestError(`Invalid "before" query parameter value - must be a valid datetime.`, parseErr)
++		}
++
++		before = parsed
++	}
++
++	purged, err := e.App.PurgeTrashedRecords(collection, before)
++	if err != nil {
++		return firstApiError(err, e.BadRequestError("Failed to purge the collection trash.", err))
++	}
++
++	return execAfterSuccessTx(true, e.App, func() error {
++		return e.JSON(http.StatusOK, map[string]any{"purged": purged})
++	})
++}
++
++// Supported values of the "trashed" records query parameter.
++const (
++	trashedModeNone = ""     // only the live records (default)
++	trashedModeWith = "with" // both the live and the trashed records
++	trashedModeOnly = "only" // only the trashed records
++)
++
++// resolveTrashedMode reads and validates the "trashed" query parameter.
++//
++// The parameter is accepted but has no effect for collections without the
++// soft delete mode enabled so that they keep behaving exactly as before.
++func resolveTrashedMode(e *core.RequestEvent, collection *core.Collection) (string, error) {
++	// a collection without the mode has no trash to ask about, so the
++	// parameter is ignored rather than validated: rejecting a value there
++	// would make such a collection answer differently depending on a
++	// parameter that means nothing to it
++	if !collection.IsSoftDeleteEnabled() {
++		return trashedModeNone, nil
++	}
++
++	// not asking is the only way to get the default: a sent parameter names a
++	// mode, and an empty one names none of them
++	query := e.Request.URL.Query()
++	if !query.Has("trashed") {
++		return trashedModeNone, nil
++	}
++
++	mode := query.Get("trashed")
++
++	switch mode {
++	case trashedModeWith, trashedModeOnly:
++		// supported
++	default:
++		return "", e.BadRequestError(`Invalid "trashed" query parameter value - must be "with" or "only".`, nil)
++	}
++
++	return mode, nil
++}
++
++// resolvePurgeParam reads and validates the "purge" delete query parameter.
++func resolvePurgeParam(e *core.RequestEvent) (bool, error) {
++	// only an absent parameter falls back to the ordinary delete; anything
++	// that was sent has to read as a boolean, the empty value included
++	query := e.Request.URL.Query()
++	if !query.Has("purge") {
++		return false, nil
++	}
++
++	purge, err := strconv.ParseBool(query.Get("purge"))
++	if err != nil {
++		return false, e.BadRequestError(`Invalid "purge" query parameter value - must be a boolean.`, err)
++	}
++
++	return purge, nil
++}
++
++// findRecordForTrashedMode loads a single record honouring the requested
++// trashed mode.
++func findRecordForTrashedMode(
++	e *core.RequestEvent,
++	collection *core.Collection,
++	recordId string,
++	mode string,
++	ruleFunc func(q *dbx.SelectQuery) error,
++) (*core.Record, error) {
++	switch mode {
++	case trashedModeWith:
++		return e.App.FindRecordByIdWithTrashed(collection, recordId, ruleFunc)
++	case trashedModeOnly:
++		return e.App.FindTrashedRecordById(collection, recordId, ruleFunc)
++	default:
++		return e.App.FindRecordById(collection, recordId, ruleFunc)
++	}
+ }
+ 
+ func recordsList(e *core.RequestEvent) error {
+@@ -59,7 +181,20 @@ func recordsList(e *core.RequestEvent) error {
+ 		return err
+ 	}
+ 
+-	query := e.App.RecordQuery(collection)
++	trashedMode, err := resolveTrashedMode(e, collection)
++	if err != nil {
++		return err
++	}
++
++	var query *dbx.SelectQuery
++	switch trashedMode {
++	case trashedModeWith:
++		query = e.App.RecordQueryWithTrashed(collection)
++	case trashedModeOnly:
++		query = e.App.TrashedRecordQuery(collection)
++	default:
++		query = e.App.RecordQuery(collection)
++	}
+ 
+ 	fieldsResolver := core.NewRecordFieldResolver(e.App, collection, requestInfo, true)
+ 
+@@ -185,7 +320,12 @@ func recordView(e *core.RequestEvent) error {
+ 		return nil
+ 	}
+ 
+-	record, fetchErr := e.App.FindRecordById(collection, recordId, ruleFunc)
++	trashedMode, err := resolveTrashedMode(e, collection)
++	if err != nil {
++		return err
++	}
++
++	record, fetchErr := findRecordForTrashedMode(e, collection, recordId, trashedMode, ruleFunc)
+ 	if fetchErr != nil || record == nil {
+ 		return firstApiError(err, e.NotFoundError("", fetchErr))
+ 	}
+@@ -577,7 +717,18 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
+ 			return nil
+ 		}
+ 
+-		record, err := e.App.FindRecordById(collection, recordId, ruleFunc)
++		purge, err := resolvePurgeParam(e)
++		if err != nil {
++			return err
++		}
++
++		// an explicit purge is allowed to reach the already trashed records as well
++		lookupMode := trashedModeNone
++		if purge {
++			lookupMode = trashedModeWith
++		}
++
++		record, err := findRecordForTrashedMode(e, collection, recordId, lookupMode, ruleFunc)
+ 		if err != nil || record == nil {
+ 			return e.NotFoundError("", err)
+ 		}
+@@ -590,8 +741,14 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
+ 		event.Record = record
+ 
+ 		hookErr := e.App.OnRecordDeleteRequest().Trigger(event, func(e *core.RecordRequestEvent) error {
+-			if err := e.App.Delete(e.Record); err != nil {
+-				return firstApiError(err, e.BadRequestError("Failed to delete record. Make sure that the record is not part of a required relation reference.", err))
++			var deleteErr error
++			if purge {
++				deleteErr = e.App.PurgeRecord(e.Record)
++			} else {
++				deleteErr = e.App.Delete(e.Record)
++			}
++			if deleteErr != nil {
++				return firstApiError(deleteErr, e.BadRequestError("Failed to delete record. Make sure that the record is not part of a required relation reference.", deleteErr))
+ 			}
+ 
+ 			err = execAfterSuccessTx(responseWriteAfterTx, e.App, func() error {
+@@ -626,6 +783,111 @@ func recordDelete(responseWriteAfterTx bool, optFinalizer func(data any) error)
+ 	}
+ }
+ 
++func recordRestore(responseWriteAfterTx bool, optFinalizer func(data any) error) func(e *core.RequestEvent) error {
++	return func(e *core.RequestEvent) error {
++		collection, err := e.App.FindCachedCollectionByNameOrId(e.Request.PathValue("collection"))
++		if err != nil || collection == nil {
++			return e.NotFoundError("Missing collection context.", err)
++		}
++
++		if !collection.IsSoftDeleteEnabled() {
++			return e.BadRequestError("The collection doesn't have the soft delete mode enabled.", nil)
++		}
++
++		// restoring a record brings it back into the regular collection listing,
++		// so it is guarded by the same rule as a regular record update
++		err = checkCollectionRateLimit(e, collection, "update")
++		if err != nil {
++			return err
++		}
++
++		recordId := e.Request.PathValue("id")
++		if recordId == "" {
++			return e.NotFoundError("", nil)
++		}
++
++		requestInfo, err := e.RequestInfo()
++		if err != nil {
++			return firstApiError(err, e.BadRequestError("", err))
++		}
++
++		if !requestInfo.HasSuperuserAuth() && collection.UpdateRule == nil {
++			return e.ForbiddenError("Only superusers can perform this action.", nil)
++		}
++
++		ruleFunc := func(q *dbx.SelectQuery) error {
++			if !requestInfo.HasSuperuserAuth() && collection.UpdateRule != nil && *collection.UpdateRule != "" {
++				resolver := core.NewRecordFieldResolver(e.App, collection, requestInfo, true)
++
++				expr, err := search.FilterData(*collection.UpdateRule).BuildExpr(resolver)
++				if err != nil {
++					return err
++				}
++
++				q.AndWhere(expr)
++
++				err = resolver.UpdateQuery(q)
++				if err != nil {
++					return err
++				}
++			}
++			return nil
++		}
++
++		record, err := e.App.FindTrashedRecordById(collection, recordId, ruleFunc)
++		if err != nil || record == nil {
++			return e.NotFoundError("", err)
++		}
++
++		var isOptFinalizerCalled bool
++
++		event := new(core.RecordRequestEvent)
++		event.RequestEvent = e
++		event.Collection = collection
++		event.Record = record
++
++		hookErr := e.App.OnRecordUpdateRequest().Trigger(event, func(e *core.RecordRequestEvent) error {
++			if err := e.App.RestoreRecord(e.Record); err != nil {
++				return firstApiError(err, e.BadRequestError("Failed to restore record.", err))
++			}
++
++			err = EnrichRecord(e.RequestEvent, e.Record)
++			if err != nil {
++				return firstApiError(err, e.InternalServerError("Failed to enrich record", err))
++			}
++
++			err = execAfterSuccessTx(responseWriteAfterTx, e.App, func() error {
++				return e.JSON(http.StatusOK, e.Record)
++			})
++			if err != nil {
++				return err
++			}
++
++			if optFinalizer != nil {
++				isOptFinalizerCalled = true
++				err = optFinalizer(e.Record)
++				if err != nil {
++					return firstApiError(err, e.InternalServerError("", fmt.Errorf("restore optFinalizer error: %w", err)))
++				}
++			}
++
++			return nil
++		})
++		if hookErr != nil {
++			return hookErr
++		}
++
++		// e.g. in case the regular hook chain was stopped and the finalizer cannot be executed as part of the last e.Next() task
++		if !isOptFinalizerCalled && optFinalizer != nil {
++			if err := optFinalizer(event.Record); err != nil {
++				return firstApiError(err, e.InternalServerError("", fmt.Errorf("restore optFinalizer error: %w", err)))
++			}
++		}
++
++		return nil
++	}
++}
++
+ // -------------------------------------------------------------------
+ 
+ func recordDataFromRequest(e *core.RequestEvent, record *core.Record) (map[string]any, error) {
+diff --git a/core/app.go b/core/app.go
+index 1bbec9c..8a47094 100644
+--- a/core/app.go
++++ b/core/app.go
+@@ -15,6 +15,7 @@ import (
+ 	"github.com/pocketbase/pocketbase/tools/mailer"
+ 	"github.com/pocketbase/pocketbase/tools/store"
+ 	"github.com/pocketbase/pocketbase/tools/subscriptions"
++	"github.com/pocketbase/pocketbase/tools/types"
+ )
+ 
+ // App defines the main PocketBase app interface.
+@@ -572,11 +573,74 @@ type App interface {
+ 	// In case a collection id or name is provided and that collection doesn't
+ 	// actually exists, the generated query will be created with a cancelled context
+ 	// and will fail once an executor (Row(), One(), All(), etc.) is called.
++	//
++	// For collections with the soft delete mode enabled the returned query
++	// excludes the trashed records.
+ 	RecordQuery(collectionModelOrIdentifier any) *dbx.SelectQuery
+ 
++	// RecordQueryWithTrashed is the same as [App.RecordQuery] but doesn't exclude
++	// the trashed records of the soft delete enabled collections.
++	RecordQueryWithTrashed(collectionModelOrIdentifier any) *dbx.SelectQuery
++
++	// TrashedRecordQuery returns a new Record select query limited to the
++	// trashed records of the provided collection.
++	//
++	// The returned query matches no records if the collection doesn't have
++	// the soft delete mode enabled.
++	TrashedRecordQuery(collectionModelOrIdentifier any) *dbx.SelectQuery
++
+ 	// FindRecordById finds the Record model by its id.
++	//
++	// The trashed records of the soft delete enabled collections are not returned.
+ 	FindRecordById(collectionModelOrIdentifier any, recordId string, optFilters ...func(q *dbx.SelectQuery) error) (*Record, error)
+ 
++	// FindRecordByIdWithTrashed is the same as [App.FindRecordById] but it also
++	// looks into the trashed records of the soft delete enabled collections.
++	FindRecordByIdWithTrashed(collectionModelOrIdentifier any, recordId string, optFilters ...func(q *dbx.SelectQuery) error) (*Record, error)
++
++	// FindTrashedRecordById finds a single trashed Record model by its id.
++	//
++	// It returns [sql.ErrNoRows] if the record doesn't exist or is not trashed,
++	// and an error if the collection doesn't have the soft delete mode enabled.
++	FindTrashedRecordById(collectionModelOrIdentifier any, recordId string, optFilters ...func(q *dbx.SelectQuery) error) (*Record, error)
++
++	// FindAllTrashedRecords finds all trashed records of the specified soft delete
++	// enabled collection matching the optional db expressions.
++	//
++	// Returns an empty slice if no trashed records are found.
++	FindAllTrashedRecords(collectionModelOrIdentifier any, exprs ...dbx.Expression) ([]*Record, error)
++
++	// RestoreRecord moves the provided trashed record out of the trash.
++	//
++	// It is a no-op if the record is not currently trashed.
++	RestoreRecord(record *Record) error
++
++	// RestoreRecordWithContext is the same as [App.RestoreRecord] but allows
++	// specifying a context to limit the db execution.
++	RestoreRecordWithContext(ctx context.Context, record *Record) error
++
++	// PurgeRecord permanently deletes the provided record, skipping the trash
++	// even if the record collection has the soft delete mode enabled.
++	//
++	// The regular record delete hooks and the cascade delete of the referencing
++	// records are still executed.
++	PurgeRecord(record *Record) error
++
++	// PurgeRecordWithContext is the same as [App.PurgeRecord] but allows
++	// specifying a context to limit the db execution.
++	PurgeRecordWithContext(ctx context.Context, record *Record) error
++
++	// PurgeTrashedRecords permanently deletes all trashed records of the provided
++	// collection that were moved to the trash before the specified time.
++	//
++	// It returns the total number of purged records.
++	PurgeTrashedRecords(collectionModelOrIdentifier any, before types.DateTime) (int, error)
++
++	// PurgeExpiredTrashedRecords permanently deletes the trashed records that
++	// stayed in the trash for longer than the retention period configured for
++	// their collection.
++	PurgeExpiredTrashedRecords() error
++
+ 	// FindRecordsByIds finds all records by the specified ids.
+ 	// If no records are found, returns an empty slice.
+ 	FindRecordsByIds(collectionModelOrIdentifier any, recordIds []string, optFilters ...func(q *dbx.SelectQuery) error) ([]*Record, error)
+diff --git a/core/base.go b/core/base.go
+index 3d0f41c..b112abc 100644
+--- a/core/base.go
++++ b/core/base.go
+@@ -1348,6 +1348,25 @@ func supportFiles(m Model) bool {
+ 	return false
+ }
+ 
++// isTrashedModel reports whether the delete that just ran moved the model to
++// the trash rather than removing it. A record loaded out of the trash and then
++// purged is not such a transition, so its files still have to be cleaned up.
++//
++// A proxy is unwrapped the same way the neighbouring file support check does
++// it: the delete hooks run against the proxied record and mark that one, so a
++// proxy left unexamined would look like a permanent delete and cost the record
++// its files.
++func isTrashedModel(m Model) bool {
++	switch v := m.(type) {
++	case *Record:
++		return v.trashTransition
++	case RecordProxy:
++		return v.ProxyRecord() != nil && v.ProxyRecord().trashTransition
++	}
++
++	return false
++}
++
+ func (app *BaseApp) registerBaseHooks() {
+ 	deletePrefix := func(prefix string) error {
+ 		fs, err := app.NewFilesystem()
+@@ -1375,7 +1394,9 @@ func (app *BaseApp) registerBaseHooks() {
+ 	app.OnModelAfterDeleteSuccess().Bind(&hook.Handler[*ModelEvent]{
+ 		Id: "__pbFilesManagerDelete__",
+ 		Func: func(e *ModelEvent) error {
+-			if m, ok := e.Model.(FilesManager); ok && m.BaseFilesPath() != "" && supportFiles(e.Model) {
++			// note: the files of a trashed record are preserved so that
++			// an eventual restore brings back a complete record
++			if m, ok := e.Model.(FilesManager); ok && m.BaseFilesPath() != "" && supportFiles(e.Model) && !isTrashedModel(e.Model) {
+ 				// ensure that there is a trailing slash so that the list iterator could start walking from the prefix dir
+ 				// (https://github.com/pocketbase/pocketbase/discussions/5246#discussioncomment-10128955)
+ 				prefix := strings.TrimRight(m.BaseFilesPath(), "/") + "/"
+@@ -1593,6 +1614,13 @@ func (app *BaseApp) initLogger() error {
+ 		Priority: -999,
+ 	})
+ 
++	// purge the trashed records that outlived their collection retention period
++	app.Cron().Add("__pbTrashCleanup__", "0 * * * *", func() {
++		if purgeErr := app.PurgeExpiredTrashedRecords(); purgeErr != nil {
++			app.Logger().Warn("Failed to purge the expired trashed records", "error", purgeErr)
++		}
++	})
++
+ 	// cleanup old logs
+ 	app.Cron().Add("__pbLogsCleanup__", "0 */6 * * *", func() {
+ 		deleteErr := app.DeleteOldLogs(time.Now().AddDate(0, 0, -1*app.Settings().Logs.MaxDays))
+diff --git a/core/collection_import.go b/core/collection_import.go
+index e169a55..9eb6097 100644
+--- a/core/collection_import.go
++++ b/core/collection_import.go
+@@ -167,6 +167,13 @@ func (app *BaseApp) ImportCollections(toImport []map[string]any, deleteMissing b
+ 
+ 		// upsert imported collections
+ 		for _, imported := range importedCollections {
++			// an enabled collection serializes its generated "deleted" field
++			// along with the option, so an import is allowed to bring that
++			// field back rather than colliding with it - but only where the
++			// stored collection does not already have a "deleted" field of its
++			// own, which the import would otherwise take over
++			imported.adoptGeneratedDeletedField(mappedExisting[imported.Id])
++
+ 			if err := txApp.SaveNoValidate(imported); err != nil {
+ 				return fmt.Errorf("failed to save collection %q: %w", imported.Name, err)
+ 			}
+diff --git a/core/collection_model.go b/core/collection_model.go
+index 2ed040a..624eac2 100644
+--- a/core/collection_model.go
++++ b/core/collection_model.go
+@@ -3,6 +3,7 @@ package core
+ import (
+ 	"encoding/json/v2"
+ 	"fmt"
++	"slices"
+ 	"strconv"
+ 	"strings"
+ 
+@@ -355,6 +356,22 @@ type baseCollection struct {
+ 	disableIntegrityChecks bool
+ 	autogeneratedId        string
+ 
++	// ownDeletedField records whether the submitted fields already carried a
++	// "deleted" field before the default field initialization ran.
++	ownDeletedField bool
++
++	// generatedDeletedField records that the "deleted" field on this instance
++	// was put there by this mode rather than by the caller.
++	//
++	// A save that fails after the field was injected leaves it on the same
++	// in-memory collection, so without the marker a retry would mistake this
++	// mode's own field for one the caller defined and refuse forever.
++	generatedDeletedField bool
++
++	// previousSoftDelete is the persisted state of the option, which is what
++	// decides whether the "deleted" field and its index belong to this mode.
++	previousSoftDelete bool
++
+ 	ListRule   *string `db:"listRule" json:"listRule" form:"listRule"`
+ 	ViewRule   *string `db:"viewRule" json:"viewRule" form:"viewRule"`
+ 	CreateRule *string `db:"createRule" json:"createRule" form:"createRule"`
+@@ -381,6 +398,7 @@ type baseCollection struct {
+ // Collection defines the table, fields and various options related to a set of records.
+ type Collection struct {
+ 	baseCollection
++	collectionBaseOptions
+ 	collectionAuthOptions
+ 	collectionViewOptions
+ }
+@@ -486,6 +504,14 @@ func (m *Collection) IsView() bool {
+ 	return m.Type == CollectionTypeView
+ }
+ 
++// IsSoftDeleteEnabled checks whether the collection records should be
++// moved to the trash instead of being removed on delete.
++//
++// The soft delete mode is available only for "base" collections.
++func (m *Collection) IsSoftDeleteEnabled() bool {
++	return m.IsBase() && m.SoftDelete
++}
++
+ // IntegrityChecks toggles the current collection integrity checks (ex. checking references on delete).
+ func (m *Collection) IntegrityChecks(enable bool) {
+ 	m.disableIntegrityChecks = !enable
+@@ -512,6 +538,8 @@ func (m *Collection) unmarshalRawOptions() error {
+ 		return json.Unmarshal(raw, &m.collectionViewOptions)
+ 	case CollectionTypeAuth:
+ 		return json.Unmarshal(raw, &m.collectionAuthOptions)
++	case CollectionTypeBase:
++		return json.Unmarshal(raw, &m.collectionBaseOptions)
+ 	}
+ 
+ 	return nil
+@@ -585,7 +613,12 @@ func (m Collection) MarshalJSON() ([]byte, error) {
+ 
+ 		return json.Marshal(alias, json.Deterministic(true))
+ 	default:
+-		return json.Marshal(m.baseCollection, json.Deterministic(true))
++		alias := struct {
++			baseCollection
++			collectionBaseOptions
++		}{m.baseCollection, m.collectionBaseOptions}
++
++		return json.Marshal(alias, json.Deterministic(true))
+ 	}
+ }
+ 
+@@ -627,6 +660,16 @@ func (m *Collection) DBExport(app App) (map[string]any, error) {
+ 		} else {
+ 			return nil, err
+ 		}
++	case CollectionTypeBase:
++		// keep the historic empty options placeholder for the collections
++		// that don't use any of the base options
++		if m.SoftDelete {
++			if raw, err := types.ParseJSONRaw(m.collectionBaseOptions); err == nil {
++				result["options"] = raw
++			} else {
++				return nil, err
++			}
++		}
+ 	}
+ 
+ 	return result, nil
+@@ -814,6 +857,22 @@ func onCollectionSave(e *CollectionEvent) error {
+ 	// like default field id are applied
+ 	e.Collection.Fields = NewFieldsList(e.Collection.Fields...)
+ 
++	// note: both have to be sampled before the default fields are injected,
++	// otherwise the field this mode adds is indistinguishable from one the
++	// collection defined itself
++	if e.Collection.IsBase() {
++		e.Collection.ownDeletedField = e.Collection.Fields.GetByName(FieldNameDeleted) != nil &&
++			!e.Collection.generatedDeletedField
++		e.Collection.previousSoftDelete = false
++
++		if !e.Collection.IsNew() {
++			persisted := &Collection{}
++			if err := e.App.ModelQuery(persisted).Model(e.Collection.LastSavedPK(), persisted); err == nil {
++				e.Collection.previousSoftDelete = persisted.SoftDelete
++			}
++		}
++	}
++
+ 	e.Collection.initDefaultFields()
+ 
+ 	if e.Collection.IsAuth() {
+@@ -942,6 +1001,8 @@ func (c *Collection) initDefaultFields() {
+ 	switch c.Type {
+ 	case CollectionTypeBase:
+ 		c.initIdField()
++		c.initDeletedField()
++		c.initDeletedFieldIndex()
+ 	case CollectionTypeAuth:
+ 		c.initIdField()
+ 		c.initPasswordField()
+@@ -983,6 +1044,203 @@ func (c *Collection) initIdField() {
+ 	}
+ }
+ 
++// adoptGeneratedDeletedField marks a submitted "deleted" field as this mode's
++// own, so that a later save does not read it as a name the collection claimed
++// for itself.
++//
++// It exists for the import path alone. A serialized enabled collection carries
++// both the option and the generated field, so restoring one has to be able to
++// bring that field back, while a caller going through the ordinary save path
++// never reaches here and still gets the name refused. Only this mode's own
++// shape is adopted; any other field of that name keeps conflicting.
++//
++// persisted is the collection as the database holds it, or nil when the import
++// creates it. It decides whether the field on the import is this mode's to
++// claim: a snapshot cannot say where the field of a collection that already
++// exists came from, so the answer has to come from what is already stored.
++func (c *Collection) adoptGeneratedDeletedField(persisted *Collection) {
++	if !c.IsBase() || !c.SoftDelete {
++		return
++	}
++
++	// a stored collection that has the name without the mode owns it, and an
++	// import that turns the mode on is the enable the refusal is written for.
++	// Adopting here would hand this mode a field somebody else created and
++	// quietly restamp it as generated, so the field stays theirs and the save
++	// is left to refuse the transition
++	if persisted != nil &&
++		!persisted.IsSoftDeleteEnabled() &&
++		persisted.Fields.GetByName(FieldNameDeleted) != nil {
++		return
++	}
++
++	if field, ok := c.Fields.GetByName(FieldNameDeleted).(*DateField); ok && field.System {
++		c.generatedDeletedField = true
++	}
++}
++
++// initDeletedField initializes (or removes) the "deleted" system field
++// that stores the timestamp at which a record was moved to the trash.
++//
++// The field exists only while the collection has the soft delete mode enabled,
++// so that turning the option off also drops the no longer needed column.
++func (c *Collection) initDeletedField() {
++	existing := c.Fields.GetByName(FieldNameDeleted)
++
++	if !c.SoftDelete {
++		// the field is this mode's to take away when the persisted state says
++		// the name belonged to it, or when this very instance injected it.
++		// The second half matters for a retry: an enable refused by
++		// validation never reaches the database, so the persisted state
++		// still reads disabled while the field it added is sitting on the
++		// model, and a corrected save would carry it through
++		if (c.previousSoftDelete || c.generatedDeletedField) && existing != nil {
++			c.Fields.RemoveByName(FieldNameDeleted)
++		}
++
++		return
++	}
++
++	if c.previousSoftDelete || c.generatedDeletedField {
++		// the name belongs to this mode - either it was already on, or the
++		// submitted field is its own generated shape - so the field is put
++		// back whatever the submitted schema did with it
++		if field, ok := existing.(*DateField); ok {
++			field.System = true
++			field.Hidden = false
++			field.Required = false
++			field.Min = types.DateTime{}
++			field.Max = types.DateTime{}
++			c.generatedDeletedField = true
++
++			return
++		}
++
++		if existing != nil {
++			c.Fields.RemoveByName(FieldNameDeleted)
++		}
++
++		c.Fields.Add(&DateField{
++			Name:   FieldNameDeleted,
++			System: true,
++		})
++		c.generatedDeletedField = true
++
++		return
++	}
++
++	// turning the mode on
++	if existing != nil {
++		// the collection defined the name first, so it is not this mode's to
++		// take over - the collection validator reports the conflict
++		return
++	}
++
++	c.Fields.Add(&DateField{
++		Name:   FieldNameDeleted,
++		System: true,
++	})
++	c.generatedDeletedField = true
++}
++
++// initDeletedFieldIndex ensures that there is an index for the trash timestamp
++// so that hiding the trashed records doesn't turn every listing into a table scan.
++func (c *Collection) initDeletedFieldIndex() {
++	indexName := c.fieldIndexName(FieldNameDeleted)
++	existing := c.GetIndex(indexName)
++
++	if !c.SoftDelete {
++		// same ownership as the field itself, so an index left behind by a
++		// refused enable goes with it
++		if c.previousSoftDelete || c.generatedDeletedField {
++			if isSoftDeleteFieldIndex(existing) {
++				c.RemoveIndex(indexName)
++			}
++
++			// the column goes with the field, so every index standing on it
++			// goes too. Leaving one behind would have the table sync drop the
++			// column and then try to recreate that definition against a
++			// column that is no longer there, which fails the whole toggle
++			// RemoveIndex rewrites c.Indexes, so walk a copy of it
++			for _, raw := range slices.Clone(c.Indexes) {
++				if indexUsesDeletedField(raw) {
++					if parsed := dbutils.ParseIndex(raw); parsed.IndexName != "" {
++						c.RemoveIndex(parsed.IndexName)
++					}
++				}
++			}
++
++			c.generatedDeletedField = false
++		}
++
++		return
++	}
++
++	if existing == "" {
++		c.AddIndex(indexName, false, "`"+FieldNameDeleted+"`", "")
++	}
++}
++
++// indexUsesDeletedField reports whether the index definition stands on the
++// column this mode generates, whichever collection defined it.
++func indexUsesDeletedField(raw string) bool {
++	parsed := dbutils.ParseIndex(raw)
++	if !parsed.IsValid() {
++		return false
++	}
++
++	for _, column := range parsed.Columns {
++		if strings.EqualFold(column.Name, FieldNameDeleted) {
++			return true
++		}
++	}
++
++	// the condition is read as SQL rather than as text: a column such as
++	// "is_deleted" contains the generated name but is not it, and a literal
++	// that spells it is not a reference either
++	return mentionsIdentifier(stripStringLiterals(parsed.Where), FieldNameDeleted)
++}
++
++// isSoftDeleteFieldIndex reports whether the expression is the plain single
++// column index on the trash timestamp that this mode creates.
++//
++// The generated name is derived from the field and collection, so a collection
++// could already carry an unrelated index under it; dropping that one on a
++// toggle would lose an expression the collection is entitled to keep.
++func isSoftDeleteFieldIndex(raw string) bool {
++	if raw == "" {
++		return false
++	}
++
++	parsed := dbutils.ParseIndex(raw)
++
++	return parsed.IsValid() &&
++		!parsed.Unique &&
++		parsed.Where == "" &&
++		len(parsed.Columns) == 1 &&
++		strings.EqualFold(strings.Trim(parsed.Columns[0].Name, "`"), FieldNameDeleted)
++}
++
++// softDeleteIndexCondition is the partial index condition applied to the unique
++// indexes of a soft delete enabled collection when they are created.
++//
++// It is never written back into the collection's stored expressions, so
++// turning the mode off gives those back exactly as they were.
++const softDeleteIndexCondition = "`" + FieldNameDeleted + "` = ''"
++
++// withSoftDeleteIndexCondition returns the index WHERE clause extended with
++// the trashed rows exclusion.
++func withSoftDeleteIndexCondition(where string) string {
++	trimmed := strings.TrimSpace(where)
++	if trimmed == "" {
++		return softDeleteIndexCondition
++	}
++
++	// the existing condition is parenthesised so that an "OR" inside it cannot
++	// change meaning once the exclusion is appended
++	return "(" + trimmed + ") AND " + softDeleteIndexCondition
++}
++
+ func (c *Collection) initPasswordField() {
+ 	field, _ := c.Fields.GetByName(FieldNamePassword).(*PasswordField)
+ 	if field == nil {
+diff --git a/core/collection_model_base_options.go b/core/collection_model_base_options.go
+index 924312b..bf9e708 100644
+--- a/core/collection_model_base_options.go
++++ b/core/collection_model_base_options.go
+@@ -1,11 +1,38 @@
+ package core
+ 
++import (
++	validation "github.com/pocketbase/ozzo-validation/v4"
++)
++
+ var _ optionsValidator = (*collectionBaseOptions)(nil)
+ 
+ // collectionBaseOptions defines the options for the "base" type collection.
+ type collectionBaseOptions struct {
++	// SoftDelete enables the trash/restore mode for the collection records.
++	//
++	// When enabled, a "deleted" system [DateField] is added to the collection
++	// and deleting a record only stamps that field instead of removing the row.
++	SoftDelete bool `form:"softDelete" json:"softDelete,omitzero"`
++
++	// TrashRetention specifies the time in seconds after which a trashed
++	// record is automatically purged.
++	//
++	// The zero value keeps the trashed records forever.
++	//
++	// It requires SoftDelete to be enabled.
++	TrashRetention int `form:"trashRetention" json:"trashRetention,omitzero"`
+ }
+ 
+ func (o *collectionBaseOptions) validate(cv *collectionValidator) error {
+-	return nil
++	return validation.ValidateStruct(o,
++		validation.Field(&o.SoftDelete, validation.By(cv.checkSoftDeleteField)),
++		validation.Field(
++			&o.TrashRetention,
++			validation.Min(0),
++			validation.When(
++				!o.SoftDelete,
++				validation.In(0).Error("The trash retention requires the soft delete mode to be enabled."),
++			),
++		),
++	)
+ }
+diff --git a/core/collection_query.go b/core/collection_query.go
+index 3821067..70a8e41 100644
+--- a/core/collection_query.go
++++ b/core/collection_query.go
+@@ -218,6 +218,10 @@ func (app *BaseApp) IsCollectionNameUnique(name string, excludeIds ...string) bo
+ //
+ // Note that this method will also trigger the records related
+ // cascade and file delete actions.
++//
++// The trash is emptied along with the rest: a truncate removes every record
++// of the collection, so the soft delete mode cannot turn it into a delete
++// that leaves the rows and their files behind.
+ func (app *BaseApp) TruncateCollection(collection *Collection) error {
+ 	if collection.IsView() {
+ 		return errors.New("view collections cannot be truncated since they don't store their own records")
+@@ -227,7 +231,9 @@ func (app *BaseApp) TruncateCollection(collection *Collection) error {
+ 		records := make([]*Record, 0, 500)
+ 
+ 		for {
+-			err := txApp.RecordQuery(collection).Limit(500).All(&records)
++			// the query has to see the trashed records too, otherwise they are
++			// never selected and the loop ends with rows still in the table
++			err := txApp.RecordQueryWithTrashed(collection).Limit(500).All(&records)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -237,7 +243,7 @@ func (app *BaseApp) TruncateCollection(collection *Collection) error {
+ 			}
+ 
+ 			for _, record := range records {
+-				err = txApp.Delete(record)
++				err = txApp.PurgeRecord(record)
+ 				if err != nil && !errors.Is(err, sql.ErrNoRows) {
+ 					return err
+ 				}
+diff --git a/core/collection_record_table_sync.go b/core/collection_record_table_sync.go
+index 93967c5..149a9ba 100644
+--- a/core/collection_record_table_sync.go
++++ b/core/collection_record_table_sync.go
+@@ -340,6 +340,12 @@ func createCollectionIndexes(app App, collection *Collection) error {
+ 			// ensure that the index is always for the current collection
+ 			parsed.TableName = collection.Name
+ 
++			// keep the trashed rows out of the unique constraints without
++			// touching the collection's stored expression
++			if parsed.Unique && collection.IsSoftDeleteEnabled() {
++				parsed.Where = withSoftDeleteIndexCondition(parsed.Where)
++			}
++
+ 			if !parsed.IsValid() {
+ 				errs[strconv.Itoa(i)] = validation.NewError(
+ 					"validation_invalid_index_expression",
+diff --git a/core/collection_validate.go b/core/collection_validate.go
+index a63b503..bb7a1d7 100644
+--- a/core/collection_validate.go
++++ b/core/collection_validate.go
+@@ -325,6 +325,18 @@ func (cv *collectionValidator) checkViewQuery(value any) error {
+ 		return validation.NewError("validation_invalid_view_query", "Invalid query - "+rawErr)
+ 	}
+ 
++	source, err := viewQueryReadsSoftDelete(cv.app, v)
++	if err != nil {
++		return err
++	}
++
++	if source != "" {
++		return validation.NewError(
++			"validation_view_query_soft_delete_source",
++			`Invalid query - the "`+source+`" collection has the soft delete mode enabled and a view would read its trashed records.`,
++		)
++	}
++
+ 	return nil
+ }
+ 
+@@ -422,6 +434,60 @@ func (cv *collectionValidator) checkMinFields(value any) error {
+ 	return nil
+ }
+ 
++// checkSoftDeleteField ensures that turning the soft delete mode on doesn't
++// collide with a field the collection defines itself.
++//
++// The mode owns the "deleted" field and the index conditions derived from it.
++// Adopting a field the collection already had would make those conditions
++// indistinguishable from ones it defined, and turning the mode off again would
++// then strip an expression that was never this mode's to touch.
++func (validator *collectionValidator) checkSoftDeleteField(value any) error {
++	enabled, _ := value.(bool)
++	if !enabled {
++		return nil
++	}
++
++	// the persisted state decides, not the submitted "original": an import
++	// saves the collection before it validates it and then hands the imported
++	// object in as its own original, which would report the mode as already
++	// on and skip the conflict check entirely
++	if validator.new.previousSoftDelete {
++		return nil // already on, so the field is the one this mode created
++	}
++
++	// the system collections back the auth machinery, and its internal
++	// cleanups delete their records expecting the rows to go: leaving them in
++	// a trash would keep spent one-time passwords, mfa and oauth2 rows alive
++	if validator.new.System {
++		return validation.NewError(
++			"validation_soft_delete_system_collection",
++			"The soft delete mode cannot be enabled on a system collection.",
++		)
++	}
++
++	if validator.new.ownDeletedField {
++		return validation.NewError(
++			"validation_soft_delete_field_conflict",
++			`The soft delete mode cannot be enabled while the collection defines its own "`+FieldNameDeleted+`" field.`,
++		)
++	}
++
++	// a view reads the table directly, so it would return the trashed rows
++	dependant, err := softDeleteViewDependant(validator.app, validator.new)
++	if err != nil {
++		return err
++	}
++
++	if dependant != "" {
++		return validation.NewError(
++			"validation_soft_delete_view_dependant",
++			`The soft delete mode cannot be enabled while the "`+dependant+`" view reads this collection.`,
++		)
++	}
++
++	return nil
++}
++
+ func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) error {
+ 	fields, ok := value.(FieldsList)
+ 	if !ok {
+@@ -437,6 +503,13 @@ func (validator *collectionValidator) ensureNoSystemFieldsChange(value any) erro
+ 			continue
+ 		}
+ 
++		if oldField.GetName() == FieldNameDeleted &&
++			validator.original.SoftDelete && !validator.new.SoftDelete {
++			// the trash timestamp field goes away with the option itself,
++			// but while the option is on it is protected like any other
++			continue
++		}
++
+ 		newField := fields.GetById(oldField.GetId())
+ 
+ 		if newField == nil || oldField.GetName() != newField.GetName() {
+@@ -692,6 +765,8 @@ func (validator *collectionValidator) validateOptions() error {
+ 		return validator.new.collectionAuthOptions.validate(validator)
+ 	case CollectionTypeView:
+ 		return validator.new.collectionViewOptions.validate(validator)
++	case CollectionTypeBase:
++		return validator.new.collectionBaseOptions.validate(validator)
+ 	}
+ 
+ 	return nil
+diff --git a/core/db.go b/core/db.go
+index d92f1cb..44fa90b 100644
+--- a/core/db.go
++++ b/core/db.go
+@@ -122,6 +122,12 @@ func (app *BaseApp) delete(ctx context.Context, model Model, isForAuxDB bool) er
+ 
+ 		// db write
+ 		return e.App.OnModelDeleteExecute().Trigger(event, func(e *ModelEvent) error {
++			// a delete that moved the model into the trash still runs the
++			// handlers above, but the row itself has to stay
++			if isTrashedModel(e.Model) {
++				return nil
++			}
++
+ 			var db dbx.Builder
+ 			if isForAuxDB {
+ 				db = e.App.AuxNonconcurrentDB()
+diff --git a/core/field.go b/core/field.go
+index 0c12ba8..54df4ab 100644
+--- a/core/field.go
++++ b/core/field.go
+@@ -26,6 +26,7 @@ const (
+ 	FieldNameVerified        = "verified"
+ 	FieldNameTokenKey        = "tokenKey"
+ 	FieldNamePassword        = "password"
++	FieldNameDeleted         = "deleted"
+ )
+ 
+ // SystemFields returns special internal field names that are usually readonly.
+diff --git a/core/record_field_resolver.go b/core/record_field_resolver.go
+index 425cc5e..c44c206 100644
+--- a/core/record_field_resolver.go
++++ b/core/record_field_resolver.go
+@@ -300,7 +300,20 @@ func preferGroupBy(info *dbx.QueryInfo, fullUnquotedGroupByCol string) bool {
+ //	@request.body.someField:isset
+ //	@collection.product.name
+ func (r *RecordFieldResolver) Resolve(fieldName string) (*search.ResolverResult, error) {
+-	return parseAndRun(fieldName, r)
++	result, err := parseAndRun(fieldName, r)
++	if err != nil {
++		return nil, err
++	}
++
++	// the multi-match subquery registers its joins on its own, so the trashed
++	// records exclusion has to be applied to them here as well
++	if result != nil && result.MultiMatchSubQuery != nil {
++		for _, join := range result.MultiMatchSubQuery.Joins {
++			join.On = withoutTrashedJoinRows(r.app, join.TableName, join.TableAlias, join.On)
++		}
++	}
++
++	return result, nil
+ }
+ 
+ func (r *RecordFieldResolver) resolveStaticRequestField(path ...string) (*search.ResolverResult, error) {
+@@ -402,7 +415,7 @@ func (r *RecordFieldResolver) registerJoin(tableName string, tableAlias string,
+ 	newJoin := &search.Join{
+ 		TableName:  tableName,
+ 		TableAlias: tableAlias,
+-		On:         on,
++		On:         withoutTrashedJoinRows(r.app, tableName, tableAlias, on),
+ 	}
+ 
+ 	// (see updateQueryWithCollectionListRule)
+@@ -433,6 +446,30 @@ func (r *RecordFieldResolver) registerJoin(tableName string, tableAlias string,
+ 	return nil
+ }
+ 
++// withoutTrashedJoinRows extends the join condition of a soft delete enabled
++// collection with the trashed records exclusion.
++//
++// It makes sure that a trashed record is invisible not only when it is listed
++// directly but also when it is reached through a relation, a back-relation or
++// an "@collection" filter.
++//
++// The provided table name may be an arbitrary expression (e.g. a json_each
++// subquery), in which case the condition is left untouched.
++func withoutTrashedJoinRows(app App, tableName string, tableAlias string, on dbx.Expression) dbx.Expression {
++	collection, err := getCollectionByModelOrIdentifier(app, tableName)
++	if err != nil || collection == nil || !collection.IsSoftDeleteEnabled() {
++		return on
++	}
++
++	notTrashed := dbx.NewExp(fmt.Sprintf("[[%s.%s]] = ''", tableAlias, FieldNameDeleted))
++
++	if on == nil {
++		return notTrashed
++	}
++
++	return dbx.And(on, notTrashed)
++}
++
+ func (r *RecordFieldResolver) registerRuleJoin(collection *Collection, tableAlias string) {
+ 	// replace existing
+ 	for i, j := range r.listRuleJoins {
+diff --git a/core/record_field_resolver_runner.go b/core/record_field_resolver_runner.go
+index fa65893..08abbbc 100644
+--- a/core/record_field_resolver_runner.go
++++ b/core/record_field_resolver_runner.go
+@@ -650,87 +650,124 @@ func (r *runner) processActiveProps() (*search.ResolverResult, error) {
+ 
+ 		// "id" lookups optimization for single relations to avoid unnecessary joins,
+ 		// aka. "user.id" and "user" should produce the same query identifier
++		//
++		// note: the shortcut compares the stored foreign key without touching the
++		// related table, so it cannot be taken when that table has rows to hide
+ 		if !relField.IsMultiple() &&
++			!relCollection.IsSoftDeleteEnabled() &&
+ 			// the penultimate prop is "id"
+ 			i == totalProps-2 && r.activeProps[i+1] == FieldNameId {
+ 			return r.finalizeActivePropsProcessing(collection, relField.Name, i)
+ 		}
+ 
+-		cleanFieldName := inflector.Columnify(relField.Name)
+-		prefixedFieldName := r.activeTableAlias + "." + cleanFieldName
+-		newTableAlias := r.activeTableAlias + "_" + cleanFieldName + r.resolver.joinAliasSuffix
+-		newCollectionName := relCollection.Name
++		if err := r.joinRelation(relField, relCollection); err != nil {
++			return nil, err
++		}
++	}
+ 
+-		if !relField.IsMultiple() {
+-			err := r.resolver.registerJoin(
+-				inflector.Columnify(newCollectionName),
+-				newTableAlias,
+-				dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s]]", newTableAlias, prefixedFieldName)),
+-			)
+-			if err != nil {
+-				return nil, err
+-			}
+-		} else {
+-			jeAlias := "__je_" + newTableAlias
++	return nil, fmt.Errorf("failed to resolve field %q", r.fieldName)
++}
+ 
+-			err := r.resolver.registerJoin(dbutils.JSONEach(prefixedFieldName), jeAlias, nil)
+-			if err != nil {
+-				return nil, err
+-			}
++// joinRelation joins the collection targeted by the provided relation field to
++// the main query and to the multi-match subquery, and moves the runner active
++// aliases to it so that the next prop is resolved against the related table.
++func (r *runner) joinRelation(relField *RelationField, relCollection *Collection) error {
++	cleanFieldName := inflector.Columnify(relField.Name)
++	prefixedFieldName := r.activeTableAlias + "." + cleanFieldName
++	newTableAlias := r.activeTableAlias + "_" + cleanFieldName + r.resolver.joinAliasSuffix
++	newCollectionName := relCollection.Name
+ 
+-			err = r.resolver.registerJoin(
+-				inflector.Columnify(newCollectionName),
+-				newTableAlias,
+-				dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s.value]]", newTableAlias, jeAlias)),
+-			)
+-			if err != nil {
+-				return nil, err
+-			}
++	// join the relation to the main query
++	// ---
++	if !relField.IsMultiple() {
++		err := r.resolver.registerJoin(
++			inflector.Columnify(newCollectionName),
++			newTableAlias,
++			dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s]]", newTableAlias, prefixedFieldName)),
++		)
++		if err != nil {
++			return err
+ 		}
++	} else {
++		jeAlias := "__je_" + newTableAlias
+ 
+-		r.activeCollectionName = newCollectionName
+-		r.activeTableAlias = newTableAlias
+-		// ---
+-
+-		// join the relation to the multi-match subquery
+-		// ---
+-		if relField.IsMultiple() {
+-			r.withMultiMatch = true // enable multimatch if not already
++		err := r.resolver.registerJoin(dbutils.JSONEach(prefixedFieldName), jeAlias, nil)
++		if err != nil {
++			return err
+ 		}
+ 
+-		newTableAlias2 := r.multiMatchActiveTableAlias + "_" + cleanFieldName
+-		prefixedFieldName2 := r.multiMatchActiveTableAlias + "." + cleanFieldName
+-
+-		if !relField.IsMultiple() {
+-			r.multiMatch.Joins = append(
+-				r.multiMatch.Joins,
+-				&search.Join{
+-					TableName:  inflector.Columnify(newCollectionName),
+-					TableAlias: newTableAlias2,
+-					On:         dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s]]", newTableAlias2, prefixedFieldName2)),
+-				},
+-			)
+-		} else {
+-			jeAlias2 := r.multiMatchActiveTableAlias + "_" + cleanFieldName + "_je"
+-			r.multiMatch.Joins = append(
+-				r.multiMatch.Joins,
+-				&search.Join{
+-					TableName:  dbutils.JSONEach(prefixedFieldName2),
+-					TableAlias: jeAlias2,
+-				},
+-				&search.Join{
+-					TableName:  inflector.Columnify(newCollectionName),
+-					TableAlias: newTableAlias2,
+-					On:         dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s.value]]", newTableAlias2, jeAlias2)),
+-				},
+-			)
++		err = r.resolver.registerJoin(
++			inflector.Columnify(newCollectionName),
++			newTableAlias,
++			dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s.value]]", newTableAlias, jeAlias)),
++		)
++		if err != nil {
++			return err
+ 		}
++	}
+ 
+-		r.multiMatchActiveTableAlias = newTableAlias2
+-		// ---
++	r.activeCollectionName = newCollectionName
++	r.activeTableAlias = newTableAlias
++	// ---
++
++	// join the relation to the multi-match subquery
++	// ---
++	if relField.IsMultiple() {
++		r.withMultiMatch = true // enable multimatch if not already
+ 	}
+ 
+-	return nil, fmt.Errorf("failed to resolve field %q", r.fieldName)
++	newTableAlias2 := r.multiMatchActiveTableAlias + "_" + cleanFieldName
++	prefixedFieldName2 := r.multiMatchActiveTableAlias + "." + cleanFieldName
++
++	if !relField.IsMultiple() {
++		r.multiMatch.Joins = append(
++			r.multiMatch.Joins,
++			&search.Join{
++				TableName:  inflector.Columnify(newCollectionName),
++				TableAlias: newTableAlias2,
++				On:         dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s]]", newTableAlias2, prefixedFieldName2)),
++			},
++		)
++	} else {
++		jeAlias2 := r.multiMatchActiveTableAlias + "_" + cleanFieldName + "_je"
++		r.multiMatch.Joins = append(
++			r.multiMatch.Joins,
++			&search.Join{
++				TableName:  dbutils.JSONEach(prefixedFieldName2),
++				TableAlias: jeAlias2,
++			},
++			&search.Join{
++				TableName:  inflector.Columnify(newCollectionName),
++				TableAlias: newTableAlias2,
++				On:         dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s.value]]", newTableAlias2, jeAlias2)),
++			},
++		)
++	}
++
++	r.multiMatchActiveTableAlias = newTableAlias2
++	// ---
++
++	return nil
++}
++
++// softDeleteRelationTarget reports whether the provided field is a relation to
++// a collection that hides its trashed records, and returns that collection.
++func (r *runner) softDeleteRelationTarget(field Field) (bool, *Collection, error) {
++	relField, ok := field.(*RelationField)
++	if !ok {
++		return false, nil, nil
++	}
++
++	relCollection, err := r.resolver.loadCollection(relField.CollectionId)
++	if err != nil {
++		return false, nil, fmt.Errorf("failed to load field %q collection", field.GetName())
++	}
++
++	if !relCollection.IsSoftDeleteEnabled() {
++		return false, nil, nil
++	}
++
++	return true, relCollection, nil
+ }
+ 
+ func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop string, propDepth int) (*search.ResolverResult, error) {
+@@ -751,6 +788,35 @@ func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop stri
+ 		return nil, fmt.Errorf("non-filterable field %q", name)
+ 	}
+ 
++	// bare relations to a soft delete enabled collection
++	// -------------------------------------------------------
++	// the nested forms reach the related table through a join, which carries
++	// the exclusion, but a bare relation is compared against the stored value
++	// - a foreign key for a single relation, a json array of them for a
++	// multiple one - and both still hold the ids of trashed targets. Both are
++	// therefore resolved from the related table instead, so that "rel" means
++	// the same as "rel.id" whichever form the relation takes
++	if relField, ok := field.(*RelationField); ok && (modifier == "" || modifier == lowerModifier) {
++		relCollection, err := r.resolver.loadCollection(relField.CollectionId)
++		if err != nil {
++			return nil, fmt.Errorf("failed to load field %q collection", name)
++		}
++
++		if relCollection.IsSoftDeleteEnabled() {
++			err = r.joinRelation(relField, relCollection)
++			if err != nil {
++				return nil, err
++			}
++
++			idProp := FieldNameId
++			if modifier == lowerModifier {
++				idProp += ":" + lowerModifier
++			}
++
++			return r.finalizeActivePropsProcessing(relCollection, idProp, propDepth+1)
++		}
++	}
++
+ 	multvaluer, isMultivaluer := field.(MultiValuer)
+ 
+ 	cleanFieldName := inflector.Columnify(field.GetName())
+@@ -784,8 +850,38 @@ func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop stri
+ 			return nil, err
+ 		}
+ 
++		// relations to a soft delete enabled collection
++		// -------------------------------------------------------
++		// json_each walks the stored ids, which keep listing the targets that
++		// went to the trash, and the exclusion cannot be hung off that join
++		// because its table is the json_each expression rather than the
++		// related table. Joining the related table turns each extracted id
++		// back into a row that the exclusion can drop, so ":each" hides the
++		// same targets as every other relation form.
++		trashAware, relCollection, err := r.softDeleteRelationTarget(field)
++		if err != nil {
++			return nil, err
++		}
++
++		identifier := fmt.Sprintf("[[%s.value]]", jeAlias)
++
++		if trashAware {
++			relAlias := jeAlias + "_rel"
++
++			err = r.resolver.registerJoin(
++				inflector.Columnify(relCollection.Name),
++				relAlias,
++				dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s.value]]", relAlias, jeAlias)),
++			)
++			if err != nil {
++				return nil, err
++			}
++
++			identifier = fmt.Sprintf("[[%s.id]]", relAlias)
++		}
++
+ 		result := &search.ResolverResult{
+-			Identifier: fmt.Sprintf("[[%s.value]]", jeAlias),
++			Identifier: identifier,
+ 		}
+ 
+ 		if multvaluer.IsMultiple() {
+@@ -802,6 +898,17 @@ func (r *runner) finalizeActivePropsProcessing(collection *Collection, prop stri
+ 			})
+ 			r.multiMatch.ValueIdentifier = fmt.Sprintf("[[%s.value]]", jeAlias2)
+ 
++			if trashAware {
++				relAlias2 := jeAlias2 + "_rel"
++
++				r.multiMatch.Joins = append(r.multiMatch.Joins, &search.Join{
++					TableName:  inflector.Columnify(relCollection.Name),
++					TableAlias: relAlias2,
++					On:         dbx.NewExp(fmt.Sprintf("[[%s.id]] = [[%s.value]]", relAlias2, jeAlias2)),
++				})
++				r.multiMatch.ValueIdentifier = fmt.Sprintf("[[%s.id]]", relAlias2)
++			}
++
+ 			result.MultiMatchSubQuery = r.multiMatch
+ 		}
+ 
+diff --git a/core/record_model.go b/core/record_model.go
+index b654864..3c0bcb1 100644
+--- a/core/record_model.go
++++ b/core/record_model.go
+@@ -50,6 +50,10 @@ type Record struct {
+ 	exportCustomData      bool
+ 	ignoreEmailVisibility bool
+ 	ignoreUnchangedFields bool
++
++	// trashTransition marks the single delete that moved this record into
++	// the trash, as opposed to a record that was merely loaded from it.
++	trashTransition bool
+ }
+ 
+ const systemHookIdRecord = "__pbRecordSystemHook__"
+@@ -1425,6 +1429,10 @@ func (m *Record) callFieldInterceptors(
+ }
+ 
+ func onRecordValidate(e *RecordEvent) error {
++	if err := checkTrashedRecordUpdate(e.App, e.Context, e.Record); err != nil {
++		return err
++	}
++
+ 	errs := validation.Errors{}
+ 
+ 	for _, f := range e.Record.Collection().Fields {
+@@ -1488,6 +1496,31 @@ func onRecordSaveExecute(e *RecordEvent) error {
+ }
+ 
+ func onRecordDeleteExecute(e *RecordEvent) error {
++	// the marker describes this delete alone, so a record instance reused for
++	// a later permanent delete must not still look like a trash transition
++	e.Record.trashTransition = false
++
++	// move the record to the trash instead of removing it
++	//
++	// note: an already trashed record and an explicit purge always fall
++	// through to the permanent delete below
++	if e.Record.Collection().IsSoftDeleteEnabled() &&
++		!isPurgeContext(e.Context) &&
++		!e.Record.IsTrashed() {
++		trashed, err := trashRecord(e)
++		if err != nil {
++			return err
++		}
++		if trashed {
++			// trashRecord ran the rest of the delete execute chain inside its
++			// own transaction, so there is nothing left to advance here
++			return nil
++		}
++
++		// the row turned out to be in the trash already, so this delete is
++		// the second one and falls through to the permanent delete below
++	}
++
+ 	// fetch rel references (if any)
+ 	//
+ 	// note: the select is outside of the transaction to minimize
+@@ -1507,57 +1540,77 @@ func onRecordDeleteExecute(e *RecordEvent) error {
+ 			return err
+ 		}
+ 
+-		return cascadeRecordDelete(txApp, e.Record, refs)
++		return cascadeRecordDelete(txApp, e.Context, e.Record, refs)
+ 	})
+ 	e.App = originalApp
+ 
+ 	return txErr
+ }
+ 
+-// cascadeRecordDelete triggers cascade deletion for the provided references.
++// sortedRefCollections returns the reference collections sorted by name.
+ //
+-// NB! This method is expected to be called from inside of a transaction.
+-func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Field) error {
+-	// Sort the refs keys to ensure that the cascade events firing order is always the same.
+-	// This is not necessary for the operation to function correctly but it helps having deterministic output during testing.
++// The order is not necessary for the cascade operations to function correctly
++// but it helps having a deterministic events firing order.
++func sortedRefCollections(refs map[*Collection][]Field) []*Collection {
+ 	sortedRefKeys := make([]*Collection, 0, len(refs))
+ 	for k := range refs {
+ 		sortedRefKeys = append(sortedRefKeys, k)
+ 	}
++
+ 	sort.Slice(sortedRefKeys, func(i, j int) bool {
+ 		return sortedRefKeys[i].Name < sortedRefKeys[j].Name
+ 	})
+ 
+-	for _, refCollection := range sortedRefKeys {
++	return sortedRefKeys
++}
++
++// referencingRecordIdsQuery builds the query selecting the ids of the
++// refCollection records whose field references the main record.
++func referencingRecordIdsQuery(app App, mainRecord *Record, refCollection *Collection, field Field) *dbx.SelectQuery {
++	refTableName := inflector.Columnify(refCollection.Name)
++	prefixedFieldName := refTableName + "." + inflector.Columnify(field.GetName())
++
++	query := app.DB().Select(refTableName + ".id").From(refTableName)
++
++	if opt, ok := field.(MultiValuer); !ok || !opt.IsMultiple() {
++		query.AndWhere(dbx.HashExp{prefixedFieldName: mainRecord.Id})
++	} else {
++		query.AndWhere(dbx.Exists(dbx.NewExp(fmt.Sprintf(
++			`SELECT 1 FROM %s {{__je__}} WHERE [[__je__.value]]={:jevalue}`,
++			dbutils.JSONEach(prefixedFieldName),
++		), dbx.Params{
++			"jevalue": mainRecord.Id,
++		})))
++	}
++
++	if refCollection.Id == mainRecord.Collection().Id {
++		query.AndWhere(dbx.Not(dbx.HashExp{refTableName + ".id": mainRecord.Id}))
++	}
++
++	return query
++}
++
++// cascadeRecordDelete triggers cascade deletion for the provided references.
++//
++// The referencing records are always removed permanently because the record
++// they depend on no longer exists, so a trashed copy of them could never be
++// restored into a consistent state.
++//
++// NB! This method is expected to be called from inside of a transaction.
++func cascadeRecordDelete(app App, ctx context.Context, mainRecord *Record, refs map[*Collection][]Field) error {
++	ctx = withPurgeContext(ctx)
++
++	for _, refCollection := range sortedRefCollections(refs) {
+ 		fields, ok := refs[refCollection]
+ 
+ 		if !ok || refCollection.IsView() {
+ 			continue // skip missing or view collections
+ 		}
+ 
+-		refTableName := inflector.Columnify(refCollection.Name)
+-
+ 		for _, field := range fields {
+-			prefixedFieldName := refTableName + "." + inflector.Columnify(field.GetName())
+-
+ 			// fetch only the related ids because they will be queried anyway right
+ 			// before delete to ensure that we are working with fresh record data
+-			query := app.DB().Select(refTableName + ".id").From(refTableName)
+-
+-			if opt, ok := field.(MultiValuer); !ok || !opt.IsMultiple() {
+-				query.AndWhere(dbx.HashExp{prefixedFieldName: mainRecord.Id})
+-			} else {
+-				query.AndWhere(dbx.Exists(dbx.NewExp(fmt.Sprintf(
+-					`SELECT 1 FROM %s {{__je__}} WHERE [[__je__.value]]={:jevalue}`,
+-					dbutils.JSONEach(prefixedFieldName),
+-				), dbx.Params{
+-					"jevalue": mainRecord.Id,
+-				})))
+-			}
+-
+-			if refCollection.Id == mainRecord.Collection().Id {
+-				query.AndWhere(dbx.Not(dbx.HashExp{refTableName + ".id": mainRecord.Id}))
+-			}
++			query := referencingRecordIdsQuery(app, mainRecord, refCollection, field)
+ 
+ 			// trigger cascade for each batchSize rel items until there is none
+ 			batchSize := 8000
+@@ -1573,7 +1626,7 @@ func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Fie
+ 					break
+ 				}
+ 
+-				err = deleteRefRecords(app, mainRecord, refCollection, refIds, field)
++				err = deleteRefRecords(app, ctx, mainRecord, refCollection, refIds, field)
+ 				if err != nil {
+ 					return err
+ 				}
+@@ -1595,14 +1648,16 @@ func cascadeRecordDelete(app App, mainRecord *Record, refs map[*Collection][]Fie
+ // just unset the record id from any relation field values (if they are not required).
+ //
+ // NB! This method is expected to be called from inside of a transaction.
+-func deleteRefRecords(app App, mainRecord *Record, refCollection *Collection, refIds []string, field Field) error {
++func deleteRefRecords(app App, ctx context.Context, mainRecord *Record, refCollection *Collection, refIds []string, field Field) error {
+ 	relField, _ := field.(*RelationField)
+ 	if relField == nil {
+ 		return errors.New("only RelationField is supported at the moment, got " + field.Type())
+ 	}
+ 
+ 	for _, refId := range refIds {
+-		refRecord, err := app.FindRecordById(refCollection, refId)
++		// note: the trashed referencing records are loaded as well because
++		// their relation values still have to be cleaned up
++		refRecord, err := app.FindRecordByIdWithTrashed(refCollection, refId)
+ 		if err != nil {
+ 			if errors.Is(err, sql.ErrNoRows) {
+ 				continue // already deleted
+@@ -1623,7 +1678,7 @@ func deleteRefRecords(app App, mainRecord *Record, refCollection *Collection, re
+ 		// cascade delete the reference
+ 		// (only if there are no other active references in case of multiple select)
+ 		if relField.CascadeDelete && len(ids) == 0 {
+-			if err := app.Delete(refRecord); err != nil {
++			if err := app.DeleteWithContext(ctx, refRecord); err != nil {
+ 				return err
+ 			}
+ 			// no further actions are needed (the reference is deleted)
+diff --git a/core/record_query.go b/core/record_query.go
+index 8162575..54f1006 100644
+--- a/core/record_query.go
++++ b/core/record_query.go
+@@ -23,7 +23,41 @@ var recordProxyType = reflect.TypeOf((*RecordProxy)(nil)).Elem()
+ // In case a collection id or name is provided and that collection doesn't
+ // actually exists, the generated query will be created with a cancelled context
+ // and will fail once an executor (Row(), One(), All(), etc.) is called.
++//
++// For collections with the soft delete mode enabled the returned query
++// excludes the trashed records. Use [App.RecordQueryWithTrashed] if you need
++// them included.
+ func (app *BaseApp) RecordQuery(collectionModelOrIdentifier any) *dbx.SelectQuery {
++	return app.recordQuery(collectionModelOrIdentifier, false)
++}
++
++// RecordQueryWithTrashed is the same as [App.RecordQuery] but doesn't exclude
++// the trashed records of the soft delete enabled collections.
++func (app *BaseApp) RecordQueryWithTrashed(collectionModelOrIdentifier any) *dbx.SelectQuery {
++	return app.recordQuery(collectionModelOrIdentifier, true)
++}
++
++// TrashedRecordQuery returns a new Record select query limited to the trashed
++// records of the provided collection.
++//
++// The returned query matches no records if the collection doesn't have the
++// soft delete mode enabled.
++func (app *BaseApp) TrashedRecordQuery(collectionModelOrIdentifier any) *dbx.SelectQuery {
++	query := app.recordQuery(collectionModelOrIdentifier, true)
++
++	collection, err := getCollectionByModelOrIdentifier(app, collectionModelOrIdentifier)
++	if err != nil || collection == nil {
++		return query
++	}
++
++	if !collection.IsSoftDeleteEnabled() {
++		return query.AndWhere(dbx.NewExp("1 = 0"))
++	}
++
++	return query.AndWhere(trashedExpr(collection))
++}
++
++func (app *BaseApp) recordQuery(collectionModelOrIdentifier any, includeTrashed bool) *dbx.SelectQuery {
+ 	var tableName string
+ 
+ 	collection, collectionErr := getCollectionByModelOrIdentifier(app, collectionModelOrIdentifier)
+@@ -37,6 +71,11 @@ func (app *BaseApp) RecordQuery(collectionModelOrIdentifier any) *dbx.SelectQuer
+ 
+ 	query := app.ConcurrentDB().Select(app.ConcurrentDB().QuoteSimpleColumnName(tableName) + ".*").From(tableName)
+ 
++	// hide the trashed records unless they were explicitly requested
++	if !includeTrashed && collection != nil && collection.IsSoftDeleteEnabled() {
++		query.AndWhere(notTrashedExpr(collection))
++	}
++
+ 	// in case of an error attach a new context and cancel it immediately with the error
+ 	if collectionErr != nil {
+ 		ctx, cancelFunc := context.WithCancelCause(context.Background())
+@@ -218,11 +257,98 @@ func (app *BaseApp) FindRecordById(
+ 		return nil, err
+ 	}
+ 
++	var extraExpr dbx.Expression
++	if collection.IsSoftDeleteEnabled() {
++		extraExpr = notTrashedExpr(collection)
++	}
++
++	return app.findRecordById(collection, recordId, extraExpr, optFilters...)
++}
++
++// FindRecordByIdWithTrashed is the same as [App.FindRecordById] but it also
++// looks into the trashed records of the soft delete enabled collections.
++func (app *BaseApp) FindRecordByIdWithTrashed(
++	collectionModelOrIdentifier any,
++	recordId string,
++	optFilters ...func(q *dbx.SelectQuery) error,
++) (*Record, error) {
++	return app.findRecordById(collectionModelOrIdentifier, recordId, nil, optFilters...)
++}
++
++// FindTrashedRecordById finds a single trashed Record model by its id.
++//
++// It returns [sql.ErrNoRows] if the record doesn't exist or is not trashed,
++// and an error if the collection doesn't have the soft delete mode enabled.
++func (app *BaseApp) FindTrashedRecordById(
++	collectionModelOrIdentifier any,
++	recordId string,
++	optFilters ...func(q *dbx.SelectQuery) error,
++) (*Record, error) {
++	collection, err := getCollectionByModelOrIdentifier(app, collectionModelOrIdentifier)
++	if err != nil {
++		return nil, err
++	}
++
++	if !collection.IsSoftDeleteEnabled() {
++		return nil, errors.New("the " + collection.Name + " collection doesn't have the soft delete mode enabled")
++	}
++
++	return app.findRecordById(collection, recordId, trashedExpr(collection), optFilters...)
++}
++
++// FindAllTrashedRecords finds all trashed records of the specified soft
++// delete enabled collection matching the optional db expressions.
++//
++// Returns an empty slice if no trashed records are found.
++func (app *BaseApp) FindAllTrashedRecords(collectionModelOrIdentifier any, exprs ...dbx.Expression) ([]*Record, error) {
++	collection, err := getCollectionByModelOrIdentifier(app, collectionModelOrIdentifier)
++	if err != nil {
++		return nil, err
++	}
++
++	if !collection.IsSoftDeleteEnabled() {
++		return nil, errors.New("the " + collection.Name + " collection doesn't have the soft delete mode enabled")
++	}
++
++	query := app.RecordQueryWithTrashed(collection).AndWhere(trashedExpr(collection))
++
++	for _, expr := range exprs {
++		if expr != nil {
++			query.AndWhere(expr)
++		}
++	}
++
++	records := []*Record{}
++
++	if err := query.All(&records); err != nil {
++		return nil, err
++	}
++
++	return records, nil
++}
++
++// findRecordById is the shared implementation behind the various single
++// record by id lookups.
++func (app *BaseApp) findRecordById(
++	collectionModelOrIdentifier any,
++	recordId string,
++	extraExpr dbx.Expression,
++	optFilters ...func(q *dbx.SelectQuery) error,
++) (*Record, error) {
++	collection, err := getCollectionByModelOrIdentifier(app, collectionModelOrIdentifier)
++	if err != nil {
++		return nil, err
++	}
++
+ 	record := &Record{}
+ 
+-	query := app.RecordQuery(collection).
++	query := app.RecordQueryWithTrashed(collection).
+ 		AndWhere(dbx.HashExp{collection.Name + ".id": recordId})
+ 
++	if extraExpr != nil {
++		query.AndWhere(extraExpr)
++	}
++
+ 	// apply filter funcs (if any)
+ 	for _, filter := range optFilters {
+ 		if filter == nil {
+diff --git a/core/record_query_expand.go b/core/record_query_expand.go
+index 7a87da5..f17f035 100644
+--- a/core/record_query_expand.go
++++ b/core/record_query_expand.go
+@@ -116,6 +116,12 @@ func (app *BaseApp) expandRecords(records []*Record, expandPath string, fetchFun
+ 				q.AndWhere(dbx.NewExp("[[" + indirectRelField.Name + "]] = {:id}"))
+ 			}
+ 
++			// the query is built manually, so the trashed back-related records
++			// have to be excluded explicitly
++			if indirectRel.IsSoftDeleteEnabled() {
++				q.AndWhere(dbx.HashExp{indirectRel.Name + "." + FieldNameDeleted: ""})
++			}
++
+ 			pq := q.Build().Prepare()
+ 
+ 			for _, record := range records {
+diff --git a/core/record_trash.go b/core/record_trash.go
+new file mode 100644
+index 0000000..4bdbc33
+--- /dev/null
++++ b/core/record_trash.go
+@@ -0,0 +1,1012 @@
++package core
++
++import (
++	"context"
++	"database/sql"
++	"errors"
++	"fmt"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/pocketbase/dbx"
++	validation "github.com/pocketbase/ozzo-validation/v4"
++	"github.com/pocketbase/pocketbase/tools/inflector"
++	"github.com/pocketbase/pocketbase/tools/types"
++)
++
++// purgeContextKey is the context key used to mark a delete operation as a
++// permanent removal, so that it is not intercepted by the soft delete mode.
++type purgeContextKey struct{}
++
++// withPurgeContext returns a copy of ctx marked as a permanent delete.
++func withPurgeContext(ctx context.Context) context.Context {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++
++	return context.WithValue(ctx, purgeContextKey{}, true)
++}
++
++// isPurgeContext checks whether ctx was marked as a permanent delete.
++func isPurgeContext(ctx context.Context) bool {
++	if ctx == nil {
++		return false
++	}
++
++	enabled, _ := ctx.Value(purgeContextKey{}).(bool)
++
++	return enabled
++}
++
++var (
++	trashTimestampMu   sync.Mutex
++	lastTrashTimestamp types.DateTime
++)
++
++// nextTrashTimestamp returns the timestamp to stamp the next delete with.
++//
++// The trash timestamp is what ties together the records trashed by a single
++// delete, but it is stored with a millisecond precision, so two unrelated
++// deletes could otherwise end up sharing one and a restore could bring back
++// records that have nothing to do with the restored one.
++//
++// The returned value is therefore always strictly greater than the one
++// returned by the previous call and, since that marker starts empty in every
++// new process and the system clock can be moved back, is also checked against
++// the stamps that already reached the database.
++func nextTrashTimestamp(app App) (types.DateTime, error) {
++	trashTimestampMu.Lock()
++	defer trashTimestampMu.Unlock()
++
++	// the value is stored with a millisecond precision, so the sub-millisecond
++	// part has to be dropped before comparing it with the previous one
++	now, _ := types.ParseDateTime(time.Now().UTC().Truncate(time.Millisecond))
++
++	if !now.After(lastTrashTimestamp) {
++		now = lastTrashTimestamp.Add(1 * time.Millisecond)
++	}
++
++	for {
++		taken, err := trashTimestampTaken(app, now)
++		if err != nil {
++			return types.DateTime{}, err
++		}
++
++		if !taken {
++			break
++		}
++
++		now = now.Add(1 * time.Millisecond)
++	}
++
++	lastTrashTimestamp = now
++
++	return now, nil
++}
++
++// trashTimestampTaken reports whether a record is already sitting in the trash
++// under the provided timestamp.
++//
++// Only the soft delete collections are looked at: the others have no trash and
++// no "deleted" column to look at in the first place.
++func trashTimestampTaken(app App, trashedAt types.DateTime) (bool, error) {
++	collections, err := app.FindAllCollections(CollectionTypeBase)
++	if err != nil {
++		return false, err
++	}
++
++	for _, collection := range collections {
++		if !collection.IsSoftDeleteEnabled() {
++			continue
++		}
++
++		var total int
++
++		err := app.ConcurrentDB().
++			Select("count(*)").
++			From(collection.Name).
++			AndWhere(dbx.HashExp{FieldNameDeleted: trashedAt.String()}).
++			Limit(1).
++			Row(&total)
++		if err != nil {
++			return false, err
++		}
++
++		if total > 0 {
++			return true, nil
++		}
++	}
++
++	return false, nil
++}
++
++// restoreContextKey marks the single save performed by RestoreRecord, so that
++// clearing the trash stamp cannot be done through an ordinary save.
++type restoreContextKey struct{}
++
++// withRestoreContext returns a copy of ctx marked as a restore.
++func withRestoreContext(ctx context.Context) context.Context {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++
++	return context.WithValue(ctx, restoreContextKey{}, true)
++}
++
++// IsRestoreOperation reports whether ctx belongs to a record restore.
++//
++// It is true only for the save issued by [App.RestoreRecord], so callers can
++// tell a record coming back from the trash from any later update of it.
++func IsRestoreOperation(ctx context.Context) bool {
++	if ctx == nil {
++		return false
++	}
++
++	enabled, _ := ctx.Value(restoreContextKey{}).(bool)
++
++	return enabled
++}
++
++// trashTimestampContextKey is the context key carrying the trash timestamp
++// shared by all the records moved to the trash as part of a single delete.
++type trashTimestampContextKey struct{}
++
++// withTrashTimestamp returns a copy of ctx carrying the provided trash timestamp.
++func withTrashTimestamp(ctx context.Context, trashedAt types.DateTime) context.Context {
++	if ctx == nil {
++		ctx = context.Background()
++	}
++
++	return context.WithValue(ctx, trashTimestampContextKey{}, trashedAt)
++}
++
++// trashTimestampFromContext returns the trash timestamp carried by ctx, if any.
++func trashTimestampFromContext(ctx context.Context) (types.DateTime, bool) {
++	if ctx == nil {
++		return types.DateTime{}, false
++	}
++
++	trashedAt, ok := ctx.Value(trashTimestampContextKey{}).(types.DateTime)
++
++	return trashedAt, ok
++}
++
++// IsTrashed checks whether the record is currently in the trash.
++//
++// It always returns false for collections that don't have the soft delete
++// mode enabled.
++func (m *Record) IsTrashed() bool {
++	return !m.TrashedAt().IsZero()
++}
++
++// TrashedAt returns the time at which the record was moved to the trash.
++//
++// The zero [types.DateTime] is returned for records that are not trashed or
++// that belong to a collection without the soft delete mode enabled.
++func (m *Record) TrashedAt() types.DateTime {
++	if m.collection == nil || !m.collection.IsSoftDeleteEnabled() {
++		return types.DateTime{}
++	}
++
++	return m.GetDateTime(FieldNameDeleted)
++}
++
++// viewQueryReadsSoftDelete reports whether the provided view query selects from
++// a collection whose records can be in the trash.
++//
++// A view is stored as plain SQL over the source table, so it reads the trashed
++// rows straight through and none of the record query exclusions apply to it.
++// Rather than rewrite arbitrary user SQL, the pairing is refused outright, and
++// the visibility contract holds for every ordinary read.
++func viewQueryReadsSoftDelete(app App, selectQuery string) (string, error) {
++	if selectQuery == "" {
++		return "", nil
++	}
++
++	collections, err := app.FindAllCollections(CollectionTypeBase)
++	if err != nil {
++		return "", err
++	}
++
++	names := make([]string, 0, len(collections))
++	for _, collection := range collections {
++		if collection.IsSoftDeleteEnabled() {
++			names = append(names, collection.Name)
++		}
++	}
++
++	if len(names) == 0 {
++		return "", nil
++	}
++
++	// the reported name is the first in a stable order
++	sort.Strings(names)
++
++	for _, name := range names {
++		if mentionsIdentifier(selectQuery, name) {
++			return name, nil
++		}
++	}
++
++	return "", nil
++}
++
++// softDeleteViewDependant returns the name of an existing view that reads the
++// provided collection, if there is one.
++func softDeleteViewDependant(app App, collection *Collection) (string, error) {
++	views, err := app.FindAllCollections(CollectionTypeView)
++	if err != nil {
++		return "", err
++	}
++
++	for _, view := range views {
++		if mentionsIdentifier(view.ViewQuery, collection.Name) {
++			return view.Name, nil
++		}
++	}
++
++	return "", nil
++}
++
++// mentionsIdentifier reports whether the SQL names the identifier anywhere,
++// as a whole word and without regard to case.
++//
++// The check reads the query text rather than its parsed sources on purpose.
++// The identifier parser splits on commas and whitespace alone, so a CTE or a
++// subquery hands it a token like "posts)" and the source goes unnoticed - and
++// a view that slips through is read without the trash predicate, because the
++// predicate hangs off the queried collection having the mode rather than off
++// the tables underneath. Reading the text refuses more than it strictly has
++// to, which is the safe direction for a rule whose failure is exposing
++// trashed rows.
++func mentionsIdentifier(text string, name string) bool {
++	if text == "" || name == "" {
++		return false
++	}
++
++	haystack := strings.ToLower(text)
++	needle := strings.ToLower(name)
++
++	for offset := 0; offset <= len(haystack)-len(needle); {
++		i := strings.Index(haystack[offset:], needle)
++		if i < 0 {
++			return false
++		}
++
++		start := offset + i
++		end := start + len(needle)
++
++		if !isIdentifierByte(byteBefore(haystack, start)) && !isIdentifierByte(byteAfter(haystack, end)) {
++			return true
++		}
++
++		offset = start + 1
++	}
++
++	return false
++}
++
++func isIdentifierByte(b byte) bool {
++	return b == '_' ||
++		(b >= 'a' && b <= 'z') ||
++		(b >= 'A' && b <= 'Z') ||
++		(b >= '0' && b <= '9')
++}
++
++func byteBefore(s string, i int) byte {
++	if i <= 0 {
++		return 0
++	}
++	return s[i-1]
++}
++
++func byteAfter(s string, i int) byte {
++	if i >= len(s) {
++		return 0
++	}
++	return s[i]
++}
++
++// stripStringLiterals blanks out the single quoted literals of an SQL
++// expression so that their contents are not mistaken for identifiers.
++func stripStringLiterals(expr string) string {
++	var b strings.Builder
++	b.Grow(len(expr))
++
++	inLiteral := false
++
++	for i := 0; i < len(expr); i++ {
++		c := expr[i]
++
++		if c == '\'' {
++			inLiteral = !inLiteral
++			b.WriteByte(' ')
++
++			continue
++		}
++
++		if inLiteral {
++			b.WriteByte(' ')
++
++			continue
++		}
++
++		b.WriteByte(c)
++	}
++
++	return b.String()
++}
++
++// notTrashedExpr returns the expression matching only the records of the
++// provided collection that are NOT in the trash.
++func notTrashedExpr(collection *Collection) dbx.Expression {
++	return dbx.HashExp{collection.Name + "." + FieldNameDeleted: ""}
++}
++
++// trashedExpr returns the expression matching only the records of the
++// provided collection that ARE in the trash.
++func trashedExpr(collection *Collection) dbx.Expression {
++	return dbx.Not(notTrashedExpr(collection))
++}
++
++// trashRecord moves the deleted record to the trash together with the records
++// that reference it through a "cascade delete" relation.
++//
++// NB! It is expected to be called only for collections with the soft delete
++// mode enabled and from within the record delete execute hook.
++func trashRecord(e *RecordEvent) (bool, error) {
++	// note: the select is outside of the transaction to minimize
++	// SQLITE_BUSY errors when mixing read&write in a single transaction
++	refs, err := e.App.FindCachedCollectionReferences(e.Record.Collection())
++	if err != nil {
++		return false, err
++	}
++
++	// every record trashed as part of this delete shares the same timestamp
++	// so that a later restore can bring back exactly the same group, and the
++	// whole transition is one transaction, the way a permanent delete is
++	originalApp := e.App
++	txErr := e.App.RunInTransaction(func(txApp App) error {
++		e.App = txApp
++
++		// the stamp is picked inside the write transaction, so the scan for a
++		// free one and the row it is written to are serialized with every
++		// other writer on this database - including one in another process
++		// pointed at the same pb_data, which a process-local marker alone
++		// cannot see
++		trashedAt, ok := trashTimestampFromContext(e.Context)
++		if !ok {
++			var err error
++
++			trashedAt, err = nextTrashTimestamp(txApp)
++			if err != nil {
++				return err
++			}
++		}
++
++		if err := trashRecordExecute(e, trashedAt); err != nil {
++			return err
++		}
++
++		if err := cascadeRecordTrash(txApp, withTrashTimestamp(e.Context, trashedAt), e.Record, refs); err != nil {
++			return err
++		}
++
++		// the row stays where it is, but the rest of the delete execute chain
++		// still has to run, and it has to run here: a handler bound after this
++		// one that fails must take the transition back with it rather than
++		// leave the caller with a failed delete and an invisible record
++		return e.Next()
++	})
++	e.App = originalApp
++
++	if errors.Is(txErr, errRecordAlreadyTrashed) {
++		return false, nil
++	}
++
++	return true, txErr
++}
++
++// errRecordAlreadyTrashed reports that the row behind the deleted record was
++// found in the trash, so the delete has to remove it for good.
++//
++// It travels out of the trash transaction to roll it back; nothing is written
++// before the check, so there is nothing to undo.
++var errRecordAlreadyTrashed = errors.New("the record row is already trashed")
++
++// trashRecordExecute stamps the trash timestamp of the deleted record
++// instead of removing its row.
++func trashRecordExecute(e *RecordEvent, trashedAt types.DateTime) error {
++	collection := e.Record.Collection()
++
++	pk := e.Record.LastSavedPK()
++	if pk == "" {
++		return errors.New("the record can be trashed only if it is existing and has a non-empty primary key")
++	}
++
++	// the row is stamped only while it is still live
++	// -------------------------------------------------------
++	// the caller can be holding an instance loaded before another one trashed
++	// the same row, and that instance still reports itself as live. Letting
++	// the update decide keeps the "deleting a trashed record removes it"
++	// promise tied to the persisted state instead of an in-memory guess.
++	var affected int64
++
++	err := baseLockRetry(func(attempt int) error {
++		res, execErr := e.App.NonconcurrentDB().Update(
++			collection.Name,
++			dbx.Params{FieldNameDeleted: trashedAt.String()},
++			dbx.HashExp{idColumn: pk, FieldNameDeleted: ""},
++		).WithContext(e.Context).Execute()
++		if execErr != nil {
++			return execErr
++		}
++
++		affected, execErr = res.RowsAffected()
++
++		return execErr
++	}, defaultMaxLockRetries)
++	if err != nil {
++		return err
++	}
++
++	if affected == 0 {
++		return errRecordAlreadyTrashed
++	}
++
++	// reflect the new state in the in-memory model so that the after-delete
++	// hooks (and the caller) can tell a trashed record from a removed one
++	previous := e.Record.GetRaw(FieldNameDeleted)
++	previousOriginal := e.Record.originalData[FieldNameDeleted]
++
++	e.Record.SetRaw(FieldNameDeleted, trashedAt)
++	e.Record.originalData[FieldNameDeleted] = trashedAt
++	e.Record.trashTransition = true
++
++	// the row is only trashed once the enclosing transaction commits, so a
++	// rollback has to take the model back with it; otherwise the caller is
++	// left holding a record that looks trashed while its row is live and a
++	// retried delete would remove it for good
++	revertTrashTransitionOnRollback(e.App, e.Record, previous, previousOriginal)
++
++	return nil
++}
++
++// revertTrashTransitionOnRollback puts the in-memory trash state of the record
++// back if the transaction it was written in does not commit.
++//
++// Outside of a transaction there is nothing to wait for and the state stands.
++func revertTrashTransitionOnRollback(app App, record *Record, previous any, previousOriginal any) {
++	txInfo := app.TxInfo()
++	if txInfo == nil {
++		return
++	}
++
++	txInfo.OnComplete(func(txErr error) error {
++		if txErr == nil {
++			return nil
++		}
++
++		record.SetRaw(FieldNameDeleted, previous)
++		record.originalData[FieldNameDeleted] = previousOriginal
++		record.trashTransition = false
++
++		return nil
++	})
++}
++
++// trashCascadeBatchSize is the number of referencing record ids loaded at once
++// by the trash and restore cascades.
++const trashCascadeBatchSize = 500
++
++// maxTrashRetention is the longest retention the cutoff arithmetic can express,
++// which is far longer than any real retention period.
++const (
++	maxTrashRetention        = time.Duration(1<<63 - 1)
++	maxTrashRetentionSeconds = maxTrashRetention / time.Second
++)
++
++// eachRecordId walks the ids matched by the built query and invokes the
++// callback for each of them.
++//
++// The rows are paged with an id cursor rather than an offset because the
++// callback can modify the very rows the query matches, which would otherwise
++// either skip rows or loop forever.
++func eachRecordId(
++	idColumn string,
++	build func(cursor string) *dbx.SelectQuery,
++	callback func(refId string) error,
++) error {
++	var cursor string
++
++	for {
++		var refIds []string
++
++		err := build(cursor).
++			OrderBy(idColumn).
++			Limit(trashCascadeBatchSize).
++			Column(&refIds)
++		if err != nil {
++			return err
++		}
++
++		total := len(refIds)
++		if total == 0 {
++			return nil
++		}
++
++		for _, refId := range refIds {
++			if err := callback(refId); err != nil {
++				return err
++			}
++		}
++
++		if total < trashCascadeBatchSize {
++			return nil
++		}
++
++		cursor = refIds[total-1]
++	}
++}
++
++// cascadeRecordTrash moves to the trash the records that reference the just
++// trashed record through a "cascade delete" relation.
++//
++// Unlike the permanent delete cascade, the relation values are left untouched
++// because the trashed record is still there and could be restored later.
++//
++// NB! This method is expected to be called from inside of a transaction.
++func cascadeRecordTrash(app App, ctx context.Context, mainRecord *Record, refs map[*Collection][]Field) error {
++	for _, refCollection := range sortedRefCollections(refs) {
++		if refCollection.IsView() {
++			continue
++		}
++
++		for _, field := range refs[refCollection] {
++			relField, ok := field.(*RelationField)
++			if !ok || !relField.CascadeDelete {
++				continue // only the cascade delete relations follow the main record
++			}
++
++			idColumn := inflector.Columnify(refCollection.Name) + ".id"
++
++			err := eachRecordId(
++				idColumn,
++				func(cursor string) *dbx.SelectQuery {
++					return referencingRecordIdsQuery(app, mainRecord, refCollection, field).
++						AndWhere(dbx.NewExp("[["+idColumn+"]] > {:cursor}", dbx.Params{"cursor": cursor}))
++				},
++				func(refId string) error {
++					// note: the already trashed records are skipped, which also
++					// breaks the eventual reference cycles
++					refRecord, err := app.FindRecordById(refCollection, refId)
++					if err != nil {
++						if errors.Is(err, sql.ErrNoRows) {
++							return nil
++						}
++						return err
++					}
++
++					// for a multi-value relation the referencing record follows the
++					// main one only if the trashed record is the last live record
++					// it still points at
++					if hasOtherLiveReference(app, mainRecord, refRecord, relField) {
++						return nil
++					}
++
++					return app.DeleteWithContext(ctx, refRecord)
++				},
++			)
++			if err != nil {
++				return err
++			}
++		}
++	}
++
++	return nil
++}
++
++// hasOtherLiveReference checks whether the referencing record still points at
++// a visible record other than the one that is being trashed.
++//
++// The relation values are left alone by the trash, so the ids alone cannot
++// tell whether anything is still keeping the referencing record alive.
++func hasOtherLiveReference(app App, mainRecord *Record, refRecord *Record, relField *RelationField) bool {
++	for _, id := range refRecord.GetStringSlice(relField.Name) {
++		if id == mainRecord.Id {
++			continue
++		}
++
++		if _, err := app.FindRecordById(mainRecord.Collection(), id); err == nil {
++			return true
++		}
++	}
++
++	return false
++}
++
++// restoreGroupKey identifies a record inside a restore group.
++func restoreGroupKey(collectionId string, recordId string) string {
++	return collectionId + "/" + recordId
++}
++
++// collectRestoreGroup gathers the records that went into the trash together
++// with the provided one, aka. every trashed record stamped with its exact
++// timestamp.
++//
++// The timestamp is what the group is: one delete stamps everything it trashes
++// with the same value and no other delete may reuse that value, so the group
++// is whatever the trash holds under it. Rebuilding the group by walking the
++// cascade relations instead would answer from the schema as it stands today,
++// and a relation that stopped cascading after the delete would quietly leave
++// members behind, still carrying a stamp they are no longer found by.
++//
++// The group is returned as a whole rather than restored on the way, because a
++// member can cascade-depend on another member that hasn't been reached yet and
++// the two are only valid together.
++func collectRestoreGroup(app App, mainRecord *Record, trashedAt types.DateTime) ([]*Record, error) {
++	collections, err := app.FindAllCollections(CollectionTypeBase)
++	if err != nil {
++		return nil, err
++	}
++
++	group := []*Record{mainRecord}
++	mainKey := restoreGroupKey(mainRecord.Collection().Id, mainRecord.Id)
++
++	for _, collection := range collections {
++		if !collection.IsSoftDeleteEnabled() {
++			continue
++		}
++
++		tableName := inflector.Columnify(collection.Name)
++		idColumn := tableName + ".id"
++
++		err := eachRecordId(
++			idColumn,
++			func(cursor string) *dbx.SelectQuery {
++				return app.DB().
++					Select(idColumn).
++					From(tableName).
++					AndWhere(dbx.HashExp{tableName + "." + FieldNameDeleted: trashedAt.String()}).
++					AndWhere(dbx.NewExp("[["+idColumn+"]] > {:cursor}", dbx.Params{"cursor": cursor}))
++			},
++			func(id string) error {
++				if restoreGroupKey(collection.Id, id) == mainKey {
++					return nil // the record the restore started from
++				}
++
++				record, err := app.FindTrashedRecordById(collection, id)
++				if err != nil {
++					if errors.Is(err, sql.ErrNoRows) {
++						return nil // restored or purged in the meantime
++					}
++					return err
++				}
++
++				group = append(group, record)
++
++				return nil
++			},
++		)
++		if err != nil {
++			return nil, err
++		}
++	}
++
++	return group, nil
++}
++
++// checkTrashedRecordUpdate ensures that a record sitting in the trash is not
++// modified by anything other than a restore.
++//
++// The decision is made from the operation, not from the submitted value:
++// letting any save that happens to clear the trash stamp through would turn
++// an ordinary update into a second, unchecked restore path.
++func checkTrashedRecordUpdate(app App, ctx context.Context, record *Record) error {
++	if record.IsNew() || !record.Collection().IsSoftDeleteEnabled() {
++		return nil
++	}
++
++	if IsRestoreOperation(ctx) {
++		return nil
++	}
++
++	// the decision is made against the row rather than the caller's snapshot:
++	// an instance loaded before another one trashed the same record still
++	// carries an empty stamp, and the update writes the whole record, so
++	// trusting the snapshot would let an ordinary save resurrect the row
++	var deleted string
++
++	err := app.ConcurrentDB().
++		Select("[[" + FieldNameDeleted + "]]").
++		From(record.Collection().Name).
++		AndWhere(dbx.HashExp{idColumn: record.LastSavedPK()}).
++		Limit(1).
++		Row(&deleted)
++	if err != nil {
++		if errors.Is(err, sql.ErrNoRows) {
++			return nil // the row is gone; the update reports that on its own
++		}
++		return err
++	}
++
++	if deleted == "" {
++		return nil // the persisted record is not trashed
++	}
++
++	return validation.Errors{
++		FieldNameDeleted: validation.NewError(
++			"validation_trashed_record_update",
++			"Trashed records cannot be updated. Restore the record first.",
++		),
++	}
++}
++
++// checkRestorableRelations ensures that the record is not brought back while a
++// record it cascade-depends on is still in the trash.
++//
++// Without the check a restore could leave a visible record pointing to an
++// invisible one, which is exactly the state the cascade trash avoids.
++//
++// The members of the restore group are excluded from the check: they are
++// restored together with the record, so a dependency among them is satisfied
++// by the end of the operation no matter the order they are visited in. Only a
++// dependency that was trashed separately can block the restore.
++func checkRestorableRelations(app App, record *Record, group map[string]bool) error {
++	errs := validation.Errors{}
++
++	for _, field := range record.Collection().Fields {
++		relField, ok := field.(*RelationField)
++		if !ok || !relField.CascadeDelete {
++			continue
++		}
++
++		relCollection, err := app.FindCachedCollectionByNameOrId(relField.CollectionId)
++		if err != nil || relCollection == nil || !relCollection.IsSoftDeleteEnabled() {
++			continue
++		}
++
++		for _, relId := range record.GetStringSlice(relField.Name) {
++			if group[restoreGroupKey(relCollection.Id, relId)] {
++				continue // the related record comes back together with this one
++			}
++
++			_, err := app.FindRecordById(relCollection, relId)
++			if err == nil {
++				continue // the related record is visible
++			}
++
++			if !errors.Is(err, sql.ErrNoRows) {
++				return err
++			}
++
++			errs[relField.Name] = validation.NewError(
++				"validation_trashed_relation",
++				"The record cannot be restored while the related "+relCollection.Name+" record is still in the trash.",
++			)
++
++			break
++		}
++	}
++
++	if len(errs) > 0 {
++		return errs
++	}
++
++	return nil
++}
++
++// RestoreRecord moves the provided trashed record out of the trash.
++//
++// It is a no-op if the record is not currently trashed.
++func (app *BaseApp) RestoreRecord(record *Record) error {
++	return app.RestoreRecordWithContext(context.Background(), record)
++}
++
++// RestoreRecordWithContext is the same as [App.RestoreRecord] but allows
++// specifying a context to limit the db execution.
++func (app *BaseApp) RestoreRecordWithContext(ctx context.Context, record *Record) error {
++	if !record.Collection().IsSoftDeleteEnabled() {
++		return errors.New("the " + record.Collection().Name + " collection doesn't have the soft delete mode enabled")
++	}
++
++	if record.IsNew() {
++		return errors.New("only existing records can be restored")
++	}
++
++	if !record.IsTrashed() {
++		return nil
++	}
++
++	trashedAt := record.TrashedAt()
++
++	group, err := collectRestoreGroup(app, record, trashedAt)
++	if err != nil {
++		return err
++	}
++
++	inGroup := make(map[string]bool, len(group))
++	for _, member := range group {
++		inGroup[restoreGroupKey(member.Collection().Id, member.Id)] = true
++	}
++
++	// the whole group has to be clear before anything is written, otherwise a
++	// member rejected halfway would roll back a restore that was already valid
++	for _, member := range group {
++		if err := checkRestorableRelations(app, member, inGroup); err != nil {
++			return err
++		}
++	}
++
++	restoreCtx := withRestoreContext(ctx)
++
++	err = app.RunInTransaction(func(txApp App) error {
++		for _, member := range group {
++			member.Set(FieldNameDeleted, "")
++
++			if err := txApp.SaveWithContext(restoreCtx, member); err != nil {
++				return err
++			}
++		}
++
++		return nil
++	})
++	if err != nil {
++		// put the in-memory models back where they were so a failed restore
++		// doesn't leave the caller holding records that look live
++		for _, member := range group {
++			member.SetRaw(FieldNameDeleted, trashedAt)
++		}
++
++		return err
++	}
++
++	// the rows are live now, so the guard on further saves has to see that too
++	for _, member := range group {
++		member.originalData[FieldNameDeleted] = types.DateTime{}
++	}
++
++	// ... but only once the enclosing transaction commits. A rollback leaves
++	// the rows trashed, and a caller holding records that look live would find
++	// a retried restore doing nothing at the untrashed check
++	if txInfo := app.TxInfo(); txInfo != nil {
++		txInfo.OnComplete(func(txErr error) error {
++			if txErr == nil {
++				return nil
++			}
++
++			for _, member := range group {
++				member.SetRaw(FieldNameDeleted, trashedAt)
++				member.originalData[FieldNameDeleted] = trashedAt
++			}
++
++			return nil
++		})
++	}
++
++	return nil
++}
++
++// PurgeRecord permanently deletes the provided record, skipping the trash
++// even if the record collection has the soft delete mode enabled.
++//
++// The regular record delete hooks and the cascade delete of the referencing
++// records are still executed.
++func (app *BaseApp) PurgeRecord(record *Record) error {
++	return app.PurgeRecordWithContext(context.Background(), record)
++}
++
++// PurgeRecordWithContext is the same as [App.PurgeRecord] but allows
++// specifying a context to limit the db execution.
++func (app *BaseApp) PurgeRecordWithContext(ctx context.Context, record *Record) error {
++	return app.DeleteWithContext(withPurgeContext(ctx), record)
++}
++
++// PurgeTrashedRecords permanently deletes all trashed records of the provided
++// collection that were moved to the trash before the specified time.
++//
++// A zero "before" value purges the entire collection trash.
++//
++// It returns the total number of purged records.
++func (app *BaseApp) PurgeTrashedRecords(collectionModelOrIdentifier any, before types.DateTime) (int, error) {
++	collection, err := getCollectionByModelOrIdentifier(app, collectionModelOrIdentifier)
++	if err != nil {
++		return 0, err
++	}
++
++	if !collection.IsSoftDeleteEnabled() {
++		return 0, errors.New("the " + collection.Name + " collection doesn't have the soft delete mode enabled")
++	}
++
++	var cutoff dbx.Expression
++	if !before.IsZero() {
++		cutoff = dbx.NewExp(
++			"[["+collection.Name+"."+FieldNameDeleted+"]] < {:before}",
++			dbx.Params{"before": before.String()},
++		)
++	}
++
++	records, err := app.FindAllTrashedRecords(collection, cutoff)
++	if err != nil {
++		return 0, err
++	}
++
++	var purged int
++
++	// the rows are deleted by id, so a record restored between the select
++	// above and the delete below would be removed while it is live again.
++	// Every candidate is therefore re-read inside the transaction that
++	// deletes it and skipped unless it is still trashed and still older than
++	// the cutoff.
++	err = app.RunInTransaction(func(txApp App) error {
++		purged = 0
++
++		for _, record := range records {
++			current, err := txApp.FindTrashedRecordById(collection, record.Id)
++			if err != nil {
++				if errors.Is(err, sql.ErrNoRows) {
++					continue // restored in the meantime, or already gone
++				}
++				return err
++			}
++
++			if !before.IsZero() && !current.TrashedAt().Before(before) {
++				continue // trashed again after the cutoff
++			}
++
++			if err := txApp.PurgeRecord(current); err != nil {
++				return err
++			}
++
++			purged++
++		}
++
++		return nil
++	})
++	if err != nil {
++		return 0, err
++	}
++
++	return purged, nil
++}
++
++// PurgeExpiredTrashedRecords permanently deletes the trashed records that
++// stayed in the trash for longer than the retention period configured for
++// their collection.
++//
++// Collections without the soft delete mode or with a non-positive
++// trashRetention are skipped.
++func (app *BaseApp) PurgeExpiredTrashedRecords() error {
++	collections, err := app.FindAllCollections(CollectionTypeBase)
++	if err != nil {
++		return err
++	}
++
++	var errs []error
++
++	for _, collection := range collections {
++		if !collection.IsSoftDeleteEnabled() || collection.TrashRetention <= 0 {
++			continue
++		}
++
++		// the retention is an unbounded number of seconds, so it is clamped
++		// before it reaches the duration arithmetic: left alone, a large enough
++		// value wraps and yields a cutoff in the future, which would purge the
++		// very records it is meant to keep
++		retention := time.Duration(collection.TrashRetention) * time.Second
++		if collection.TrashRetention > int(maxTrashRetentionSeconds) {
++			retention = maxTrashRetention
++		}
++
++		before := types.NowDateTime().Add(-1 * retention)
++
++		_, purgeErr := app.PurgeTrashedRecords(collection, before)
++		if purgeErr != nil {
++			errs = append(errs, fmt.Errorf("failed to purge the expired %s trashed records: %w", collection.Name, purgeErr))
++		}
++	}
++
++	return errors.Join(errs...)
++}
+diff --git a/forms/record_upsert.go b/forms/record_upsert.go
+index 16df0ec..61859e2 100644
+--- a/forms/record_upsert.go
++++ b/forms/record_upsert.go
+@@ -89,6 +89,13 @@ func (form *RecordUpsert) HasManageAccess() bool {
+ func (form *RecordUpsert) Load(data map[string]any) {
+ 	excludeFields := []string{core.FieldNameExpand}
+ 
++	// the trash timestamp is managed internally by the delete and restore
++	// operations, but only while the mode is on - a collection without it may
++	// define an ordinary field of the same name and must keep writing to it
++	if form.record.Collection().IsSoftDeleteEnabled() {
++		excludeFields = append(excludeFields, core.FieldNameDeleted)
++	}
++
+ 	isAuth := form.record.Collection().IsAuth()
+ 
+ 	// load the special auth form fields
+diff --git a/plugins/jsvm/internal/types/generated/types.d.ts b/plugins/jsvm/internal/types/generated/types.d.ts
+index e563f42..9429ff0 100644
+--- a/plugins/jsvm/internal/types/generated/types.d.ts
++++ b/plugins/jsvm/internal/types/generated/types.d.ts
+@@ -1,4 +1,4 @@
+-// 1788714636
++// 1789459576
+ // GENERATED CODE - DO NOT MODIFY BY HAND
+ 
+ // -------------------------------------------------------------------
+@@ -6710,12 +6710,86 @@ namespace core {
+    * In case a collection id or name is provided and that collection doesn't
+    * actually exists, the generated query will be created with a cancelled context
+    * and will fail once an executor (Row(), One(), All(), etc.) is called.
++   * 
++   * For collections with the soft delete mode enabled the returned query
++   * excludes the trashed records.
+    */
+   recordQuery(collectionModelOrIdentifier: any): (dbx.SelectQuery)
++  /**
++   * RecordQueryWithTrashed is the same as [App.RecordQuery] but doesn't exclude
++   * the trashed records of the soft delete enabled collections.
++   */
++  recordQueryWithTrashed(collectionModelOrIdentifier: any): (dbx.SelectQuery)
++  /**
++   * TrashedRecordQuery returns a new Record select query limited to the
++   * trashed records of the provided collection.
++   * 
++   * The returned query matches no records if the collection doesn't have
++   * the soft delete mode enabled.
++   */
++  trashedRecordQuery(collectionModelOrIdentifier: any): (dbx.SelectQuery)
+   /**
+    * FindRecordById finds the Record model by its id.
++   * 
++   * The trashed records of the soft delete enabled collections are not returned.
+    */
+   findRecordById(collectionModelOrIdentifier: any, recordId: string, ...optFilters: ((q: dbx.SelectQuery) => void)[]): (Record)
++  /**
++   * FindRecordByIdWithTrashed is the same as [App.FindRecordById] but it also
++   * looks into the trashed records of the soft delete enabled collections.
++   */
++  findRecordByIdWithTrashed(collectionModelOrIdentifier: any, recordId: string, ...optFilters: ((q: dbx.SelectQuery) => void)[]): (Record)
++  /**
++   * FindTrashedRecordById finds a single trashed Record model by its id.
++   * 
++   * It returns [sql.ErrNoRows] if the record doesn't exist or is not trashed,
++   * and an error if the collection doesn't have the soft delete mode enabled.
++   */
++  findTrashedRecordById(collectionModelOrIdentifier: any, recordId: string, ...optFilters: ((q: dbx.SelectQuery) => void)[]): (Record)
++  /**
++   * FindAllTrashedRecords finds all trashed records of the specified soft delete
++   * enabled collection matching the optional db expressions.
++   * 
++   * Returns an empty slice if no trashed records are found.
++   */
++  findAllTrashedRecords(collectionModelOrIdentifier: any, ...exprs: dbx.Expression[]): Array<(Record | undefined)>
++  /**
++   * RestoreRecord moves the provided trashed record out of the trash.
++   * 
++   * It is a no-op if the record is not currently trashed.
++   */
++  restoreRecord(record: Record): void
++  /**
++   * RestoreRecordWithContext is the same as [App.RestoreRecord] but allows
++   * specifying a context to limit the db execution.
++   */
++  restoreRecordWithContext(ctx: context.Context, record: Record): void
++  /**
++   * PurgeRecord permanently deletes the provided record, skipping the trash
++   * even if the record collection has the soft delete mode enabled.
++   * 
++   * The regular record delete hooks and the cascade delete of the referencing
++   * records are still executed.
++   */
++  purgeRecord(record: Record): void
++  /**
++   * PurgeRecordWithContext is the same as [App.PurgeRecord] but allows
++   * specifying a context to limit the db execution.
++   */
++  purgeRecordWithContext(ctx: context.Context, record: Record): void
++  /**
++   * PurgeTrashedRecords permanently deletes all trashed records of the provided
++   * collection that were moved to the trash before the specified time.
++   * 
++   * It returns the total number of purged records.
++   */
++  purgeTrashedRecords(collectionModelOrIdentifier: any, before: types.DateTime): number
++  /**
++   * PurgeExpiredTrashedRecords permanently deletes the trashed records that
++   * stayed in the trash for longer than the retention period configured for
++   * their collection.
++   */
++  purgeExpiredTrashedRecords(): void
+   /**
+    * FindRecordsByIds finds all records by the specified ids.
+    * If no records are found, returns an empty slice.
+@@ -8546,7 +8620,7 @@ namespace core {
+  /**
+   * Collection defines the table, fields and various options related to a set of records.
+   */
+- type _sVCSHXH = baseCollection&collectionAuthOptions&collectionViewOptions
++ type _sVCSHXH = baseCollection&collectionBaseOptions&collectionAuthOptions&collectionViewOptions
+  interface Collection extends _sVCSHXH {
+  }
+  interface newCollection {
+@@ -8615,6 +8689,15 @@ namespace core {
+    */
+   isView(): boolean
+  }
++ interface Collection {
++  /**
++   * IsSoftDeleteEnabled checks whether the collection records should be
++   * moved to the trash instead of being removed on delete.
++   * 
++   * The soft delete mode is available only for "base" collections.
++   */
++  isSoftDeleteEnabled(): boolean
++ }
+  interface Collection {
+   /**
+    * IntegrityChecks toggles the current collection integrity checks (ex. checking references on delete).
+@@ -8930,6 +9013,22 @@ namespace core {
+   * collectionBaseOptions defines the options for the "base" type collection.
+   */
+  interface collectionBaseOptions {
++  /**
++   * SoftDelete enables the trash/restore mode for the collection records.
++   * 
++   * When enabled, a "deleted" system [DateField] is added to the collection
++   * and deleting a record only stamps that field instead of removing the row.
++   */
++  softDelete: boolean
++  /**
++   * TrashRetention specifies the time in seconds after which a trashed
++   * record is automatically purged.
++   * 
++   * The zero value keeps the trashed records forever.
++   * 
++   * It requires SoftDelete to be enabled.
++   */
++  trashRetention: number
+  }
+  /**
+   * collectionViewOptions defines the options for the "view" type collection.
+@@ -13566,15 +13665,61 @@ namespace core {
+    * In case a collection id or name is provided and that collection doesn't
+    * actually exists, the generated query will be created with a cancelled context
+    * and will fail once an executor (Row(), One(), All(), etc.) is called.
++   * 
++   * For collections with the soft delete mode enabled the returned query
++   * excludes the trashed records. Use [App.RecordQueryWithTrashed] if you need
++   * them included.
+    */
+   recordQuery(collectionModelOrIdentifier: any): (dbx.SelectQuery)
+  }
++ interface BaseApp {
++  /**
++   * RecordQueryWithTrashed is the same as [App.RecordQuery] but doesn't exclude
++   * the trashed records of the soft delete enabled collections.
++   */
++  recordQueryWithTrashed(collectionModelOrIdentifier: any): (dbx.SelectQuery)
++ }
++ interface BaseApp {
++  /**
++   * TrashedRecordQuery returns a new Record select query limited to the trashed
++   * records of the provided collection.
++   * 
++   * The returned query matches no records if the collection doesn't have the
++   * soft delete mode enabled.
++   */
++  trashedRecordQuery(collectionModelOrIdentifier: any): (dbx.SelectQuery)
++ }
+  interface BaseApp {
+   /**
+    * FindRecordById finds the Record model by its id.
+    */
+   findRecordById(collectionModelOrIdentifier: any, recordId: string, ...optFilters: ((q: dbx.SelectQuery) => void)[]): (Record)
+  }
++ interface BaseApp {
++  /**
++   * FindRecordByIdWithTrashed is the same as [App.FindRecordById] but it also
++   * looks into the trashed records of the soft delete enabled collections.
++   */
++  findRecordByIdWithTrashed(collectionModelOrIdentifier: any, recordId: string, ...optFilters: ((q: dbx.SelectQuery) => void)[]): (Record)
++ }
++ interface BaseApp {
++  /**
++   * FindTrashedRecordById finds a single trashed Record model by its id.
++   * 
++   * It returns [sql.ErrNoRows] if the record doesn't exist or is not trashed,
++   * and an error if the collection doesn't have the soft delete mode enabled.
++   */
++  findTrashedRecordById(collectionModelOrIdentifier: any, recordId: string, ...optFilters: ((q: dbx.SelectQuery) => void)[]): (Record)
++ }
++ interface BaseApp {
++  /**
++   * FindAllTrashedRecords finds all trashed records of the specified soft
++   * delete enabled collection matching the optional db expressions.
++   * 
++   * Returns an empty slice if no trashed records are found.
++   */
++  findAllTrashedRecords(collectionModelOrIdentifier: any, ...exprs: dbx.Expression[]): Array<(Record | undefined)>
++ }
+  interface BaseApp {
+   /**
+    * FindRecordsByIds finds all records by the specified ids.
+@@ -13781,6 +13926,105 @@ namespace core {
+    */
+   newFileToken(): string
+  }
++ /**
++  * purgeContextKey is the context key used to mark a delete operation as a
++  * permanent removal, so that it is not intercepted by the soft delete mode.
++  */
++ interface purgeContextKey {
++ }
++ /**
++  * restoreContextKey marks the single save performed by RestoreRecord, so that
++  * clearing the trash stamp cannot be done through an ordinary save.
++  */
++ interface restoreContextKey {
++ }
++ interface isRestoreOperation {
++  /**
++   * IsRestoreOperation reports whether ctx belongs to a record restore.
++   * 
++   * It is true only for the save issued by [App.RestoreRecord], so callers can
++   * tell a record coming back from the trash from any later update of it.
++   */
++  (ctx: context.Context): boolean
++ }
++ /**
++  * trashTimestampContextKey is the context key carrying the trash timestamp
++  * shared by all the records moved to the trash as part of a single delete.
++  */
++ interface trashTimestampContextKey {
++ }
++ interface Record {
++  /**
++   * IsTrashed checks whether the record is currently in the trash.
++   * 
++   * It always returns false for collections that don't have the soft delete
++   * mode enabled.
++   */
++  isTrashed(): boolean
++ }
++ interface Record {
++  /**
++   * TrashedAt returns the time at which the record was moved to the trash.
++   * 
++   * The zero [types.DateTime] is returned for records that are not trashed or
++   * that belong to a collection without the soft delete mode enabled.
++   */
++  trashedAt(): types.DateTime
++ }
++ interface BaseApp {
++  /**
++   * RestoreRecord moves the provided trashed record out of the trash.
++   * 
++   * It is a no-op if the record is not currently trashed.
++   */
++  restoreRecord(record: Record): void
++ }
++ interface BaseApp {
++  /**
++   * RestoreRecordWithContext is the same as [App.RestoreRecord] but allows
++   * specifying a context to limit the db execution.
++   */
++  restoreRecordWithContext(ctx: context.Context, record: Record): void
++ }
++ interface BaseApp {
++  /**
++   * PurgeRecord permanently deletes the provided record, skipping the trash
++   * even if the record collection has the soft delete mode enabled.
++   * 
++   * The regular record delete hooks and the cascade delete of the referencing
++   * records are still executed.
++   */
++  purgeRecord(record: Record): void
++ }
++ interface BaseApp {
++  /**
++   * PurgeRecordWithContext is the same as [App.PurgeRecord] but allows
++   * specifying a context to limit the db execution.
++   */
++  purgeRecordWithContext(ctx: context.Context, record: Record): void
++ }
++ interface BaseApp {
++  /**
++   * PurgeTrashedRecords permanently deletes all trashed records of the provided
++   * collection that were moved to the trash before the specified time.
++   * 
++   * A zero "before" value purges the entire collection trash.
++   * 
++   * It returns the total number of purged records.
++   */
++  purgeTrashedRecords(collectionModelOrIdentifier: any, before: types.DateTime): number
++ }
++ interface BaseApp {
++  /**
++   * PurgeExpiredTrashedRecords permanently deletes the trashed records that
++   * stayed in the trash for longer than the retention period configured for
++   * their collection.
++   * 
++   * Collections without the soft delete mode or with a non-positive
++   * trashRetention are skipped.
++   */
++  purgeExpiredTrashedRecords(): void
++ }
+  interface settings {
+   /**
+    * SuperuserIPs defines an optional list of the superuser allowed
+diff --git a/ui/src/apiPreview/docsBatch.js b/ui/src/apiPreview/docsBatch.js
+index 8ecc9cb..1409cd7 100644
+--- a/ui/src/apiPreview/docsBatch.js
++++ b/ui/src/apiPreview/docsBatch.js
+@@ -191,6 +191,13 @@ export function docsBatch(collection) {
+                 t.small({ className: "txt-hint" }, `(the body must have an "id" field)`),
+             ),
+             t.li(null, "record delete - ", t.code(null, "DELETE /api/collections/{collection}/records/{id}")),
++            t.li(
++                null,
++                "record restore - ",
++                t.code(null, "POST /api/collections/{collection}/records/{id}/restore"),
++                t.br(),
++                t.small({ className: "txt-hint" }, `(only for collections with the soft delete mode enabled)`),
++            ),
+         ),
+         t.p(null, "Each batch ", t.em(null, "Request"), " element has the following properties:"),
+         t.ul(

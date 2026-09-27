@@ -1,0 +1,1327 @@
+diff --git a/pkg/yqlib/decoder_plist.go b/pkg/yqlib/decoder_plist.go
+new file mode 100644
+index 00000000..dd8ab20e
+--- /dev/null
++++ b/pkg/yqlib/decoder_plist.go
+@@ -0,0 +1,331 @@
++//go:build !yq_noplist
++
++package yqlib
++
++import (
++	"bytes"
++	"encoding/base64"
++	"encoding/xml"
++	"errors"
++	"fmt"
++	"io"
++	"strconv"
++	"strings"
++	"unicode"
++)
++
++// Element names used by the XML property list format.
++const (
++	plistElementPlist   = "plist"
++	plistElementDict    = "dict"
++	plistElementArray   = "array"
++	plistElementKey     = "key"
++	plistElementString  = "string"
++	plistElementInteger = "integer"
++	plistElementReal    = "real"
++	plistElementTrue    = "true"
++	plistElementFalse   = "false"
++	plistElementData    = "data"
++	plistElementDate    = "date"
++)
++
++type plistDecoder struct {
++	document []byte
++	finished bool
++}
++
++func NewPlistDecoder() Decoder {
++	return &plistDecoder{}
++}
++
++func (dec *plistDecoder) Init(reader io.Reader) error {
++	buf := new(bytes.Buffer)
++	if _, err := buf.ReadFrom(reader); err != nil {
++		return err
++	}
++	dec.document = buf.Bytes()
++	dec.finished = false
++	return nil
++}
++
++// Decode returns the single value held by the property list. Property lists
++// hold exactly one value, so any following call reports EOF.
++func (dec *plistDecoder) Decode() (*CandidateNode, error) {
++	if dec.finished {
++		return nil, io.EOF
++	}
++	dec.finished = true
++
++	document := dec.document
++	if isBinaryPlist(document) {
++		log.Debug("plist: decoding binary property list")
++		return decodeBinaryPlist(document)
++	}
++
++	if len(bytes.TrimSpace(document)) == 0 {
++		return nil, io.EOF
++	}
++
++	log.Debug("plist: decoding xml property list")
++	return decodeXMLPlist(document)
++}
++
++func decodeXMLPlist(document []byte) (*CandidateNode, error) {
++	decoder := xml.NewDecoder(bytes.NewReader(document))
++
++	for {
++		token, err := decoder.Token()
++		if errors.Is(err, io.EOF) {
++			return nil, errors.New("bad property list: no root element found")
++		}
++		if err != nil {
++			return nil, err
++		}
++
++		start, isStart := token.(xml.StartElement)
++		if !isStart {
++			// skip the xml declaration, the doctype, comments and whitespace
++			continue
++		}
++
++		if start.Name.Local == plistElementPlist {
++			return decodePlistRoot(decoder)
++		}
++		// a bare value document, without the <plist> wrapper
++		return decodePlistValue(decoder, start)
++	}
++}
++
++// decodePlistRoot reads the single value wrapped by the <plist> element.
++func decodePlistRoot(decoder *xml.Decoder) (*CandidateNode, error) {
++	var value *CandidateNode
++
++	for {
++		token, err := decoder.Token()
++		if errors.Is(err, io.EOF) {
++			return nil, errors.New("bad property list: unclosed <plist> element")
++		}
++		if err != nil {
++			return nil, err
++		}
++
++		switch typedToken := token.(type) {
++		case xml.StartElement:
++			if value != nil {
++				return nil, errors.New("bad property list: <plist> can only hold a single value")
++			}
++			value, err = decodePlistValue(decoder, typedToken)
++			if err != nil {
++				return nil, err
++			}
++		case xml.EndElement:
++			if value == nil {
++				return nil, errors.New("bad property list: <plist> does not hold a value")
++			}
++			return value, nil
++		}
++	}
++}
++
++func decodePlistValue(decoder *xml.Decoder, start xml.StartElement) (*CandidateNode, error) {
++	switch start.Name.Local {
++	case plistElementDict:
++		return decodePlistDict(decoder)
++	case plistElementArray:
++		return decodePlistArray(decoder)
++	case plistElementTrue, plistElementFalse:
++		if err := skipPlistElement(decoder, start.Name.Local); err != nil {
++			return nil, err
++		}
++		return createPlistScalar("!!bool", start.Name.Local), nil
++	case plistElementString:
++		text, err := readPlistText(decoder, start.Name.Local)
++		if err != nil {
++			return nil, err
++		}
++		return createPlistScalar("!!str", text), nil
++	case plistElementInteger:
++		text, err := readPlistText(decoder, start.Name.Local)
++		if err != nil {
++			return nil, err
++		}
++		trimmed := strings.TrimSpace(text)
++		if _, err := strconv.ParseInt(trimmed, 10, 64); err != nil {
++			return nil, fmt.Errorf("bad property list: %v is not a valid <integer>", trimmed)
++		}
++		return createPlistScalar("!!int", trimmed), nil
++	case plistElementReal:
++		text, err := readPlistText(decoder, start.Name.Local)
++		if err != nil {
++			return nil, err
++		}
++		trimmed := strings.TrimSpace(text)
++		if _, err := strconv.ParseFloat(trimmed, 64); err != nil {
++			return nil, fmt.Errorf("bad property list: %v is not a valid <real>", trimmed)
++		}
++		return createPlistScalar("!!float", trimmed), nil
++	case plistElementData:
++		text, err := readPlistText(decoder, start.Name.Local)
++		if err != nil {
++			return nil, err
++		}
++		encoded := stripPlistWhitespace(text)
++		if _, err := base64.StdEncoding.DecodeString(encoded); err != nil {
++			return nil, errors.New("bad property list: <data> does not hold valid base64")
++		}
++		return createPlistScalar("!!binary", encoded), nil
++	case plistElementDate:
++		text, err := readPlistText(decoder, start.Name.Local)
++		if err != nil {
++			return nil, err
++		}
++		return createPlistScalar("!!timestamp", strings.TrimSpace(text)), nil
++	default:
++		return nil, fmt.Errorf("bad property list: unexpected element <%v>", start.Name.Local)
++	}
++}
++
++func decodePlistDict(decoder *xml.Decoder) (*CandidateNode, error) {
++	node := &CandidateNode{Kind: MappingNode, Tag: "!!map"}
++
++	for {
++		token, err := decoder.Token()
++		if errors.Is(err, io.EOF) {
++			return nil, errors.New("bad property list: unclosed <dict> element")
++		}
++		if err != nil {
++			return nil, err
++		}
++
++		switch typedToken := token.(type) {
++		case xml.StartElement:
++			if typedToken.Name.Local != plistElementKey {
++				return nil, fmt.Errorf("bad property list: <dict> holds a <%v> without a <key>", typedToken.Name.Local)
++			}
++			keyText, err := readPlistText(decoder, plistElementKey)
++			if err != nil {
++				return nil, err
++			}
++
++			valueStart, err := nextPlistStartElement(decoder)
++			if err != nil {
++				return nil, err
++			}
++			if valueStart == nil {
++				return nil, fmt.Errorf("bad property list: <key>%v</key> has no value", keyText)
++			}
++
++			value, err := decodePlistValue(decoder, *valueStart)
++			if err != nil {
++				return nil, err
++			}
++			node.AddKeyValueChild(createStringScalarNode(keyText), value)
++		case xml.EndElement:
++			return node, nil
++		}
++	}
++}
++
++func decodePlistArray(decoder *xml.Decoder) (*CandidateNode, error) {
++	node := &CandidateNode{Kind: SequenceNode, Tag: "!!seq"}
++
++	for {
++		token, err := decoder.Token()
++		if errors.Is(err, io.EOF) {
++			return nil, errors.New("bad property list: unclosed <array> element")
++		}
++		if err != nil {
++			return nil, err
++		}
++
++		switch typedToken := token.(type) {
++		case xml.StartElement:
++			value, err := decodePlistValue(decoder, typedToken)
++			if err != nil {
++				return nil, err
++			}
++			node.AddChild(value)
++		case xml.EndElement:
++			return node, nil
++		}
++	}
++}
++
++// nextPlistStartElement returns the next element, or nil when the enclosing
++// element is closed first.
++func nextPlistStartElement(decoder *xml.Decoder) (*xml.StartElement, error) {
++	for {
++		token, err := decoder.Token()
++		if errors.Is(err, io.EOF) {
++			return nil, errors.New("bad property list: unexpected end of document")
++		}
++		if err != nil {
++			return nil, err
++		}
++
++		switch typedToken := token.(type) {
++		case xml.StartElement:
++			return &typedToken, nil
++		case xml.EndElement:
++			return nil, nil
++		}
++	}
++}
++
++// readPlistText reads the character data of an element that cannot hold child
++// elements.
++func readPlistText(decoder *xml.Decoder, name string) (string, error) {
++	var text strings.Builder
++
++	for {
++		token, err := decoder.Token()
++		if errors.Is(err, io.EOF) {
++			return "", fmt.Errorf("bad property list: unclosed <%v> element", name)
++		}
++		if err != nil {
++			return "", err
++		}
++
++		switch typedToken := token.(type) {
++		case xml.CharData:
++			text.Write(typedToken)
++		case xml.StartElement:
++			return "", fmt.Errorf("bad property list: <%v> cannot hold a <%v> element", name, typedToken.Name.Local)
++		case xml.EndElement:
++			return text.String(), nil
++		}
++	}
++}
++
++// skipPlistElement consumes an element that cannot hold anything, like <true/>.
++func skipPlistElement(decoder *xml.Decoder, name string) error {
++	for {
++		token, err := decoder.Token()
++		if errors.Is(err, io.EOF) {
++			return fmt.Errorf("bad property list: unclosed <%v> element", name)
++		}
++		if err != nil {
++			return err
++		}
++
++		switch typedToken := token.(type) {
++		case xml.StartElement:
++			return fmt.Errorf("bad property list: <%v> cannot hold a <%v> element", name, typedToken.Name.Local)
++		case xml.EndElement:
++			return nil
++		}
++	}
++}
++
++func stripPlistWhitespace(value string) string {
++	return strings.Map(func(r rune) rune {
++		if unicode.IsSpace(r) {
++			return -1
++		}
++		return r
++	}, value)
++}
++
++func createPlistScalar(tag string, value string) *CandidateNode {
++	return &CandidateNode{Kind: ScalarNode, Tag: tag, Value: value}
++}
+diff --git a/pkg/yqlib/decoder_plist_binary.go b/pkg/yqlib/decoder_plist_binary.go
+new file mode 100644
+index 00000000..940d30c4
+--- /dev/null
++++ b/pkg/yqlib/decoder_plist_binary.go
+@@ -0,0 +1,406 @@
++//go:build !yq_noplist
++
++package yqlib
++
++import (
++	"bytes"
++	"encoding/base64"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"math"
++	"strconv"
++	"time"
++	"unicode/utf16"
++)
++
++const (
++	binaryPlistMagic       = "bplist"
++	binaryPlistTrailerSize = 32
++	// binaryPlistEpoch is the number of seconds between the unix epoch and
++	// 2001-01-01T00:00:00Z, which is what binary property lists count dates from.
++	binaryPlistEpoch = 978307200
++)
++
++// Object marker types, held in the high nibble of an object's first byte.
++const (
++	binaryPlistMarkerSingleton = 0x0
++	binaryPlistMarkerInt       = 0x1
++	binaryPlistMarkerReal      = 0x2
++	binaryPlistMarkerDate      = 0x3
++	binaryPlistMarkerData      = 0x4
++	binaryPlistMarkerASCII     = 0x5
++	binaryPlistMarkerUnicode   = 0x6
++	binaryPlistMarkerArray     = 0xA
++	binaryPlistMarkerDict      = 0xD
++)
++
++func isBinaryPlist(document []byte) bool {
++	return bytes.HasPrefix(document, []byte(binaryPlistMagic))
++}
++
++type binaryPlistParser struct {
++	document []byte
++	offsets  []uint64
++	refSize  uint8
++	// visiting guards against objects that refer back to themselves.
++	visiting map[uint64]bool
++}
++
++func decodeBinaryPlist(document []byte) (*CandidateNode, error) {
++	if len(document) < len(binaryPlistMagic)+2+binaryPlistTrailerSize {
++		return nil, errors.New("bad property list: binary property list is too short")
++	}
++
++	trailer := document[len(document)-binaryPlistTrailerSize:]
++	offsetSize := trailer[6]
++	refSize := trailer[7]
++	numObjects := binary.BigEndian.Uint64(trailer[8:16])
++	topObject := binary.BigEndian.Uint64(trailer[16:24])
++	offsetTableOffset := binary.BigEndian.Uint64(trailer[24:32])
++
++	if offsetSize < 1 || offsetSize > 8 {
++		return nil, fmt.Errorf("bad property list: invalid offset size %v", offsetSize)
++	}
++	if refSize < 1 || refSize > 8 {
++		return nil, fmt.Errorf("bad property list: invalid object reference size %v", refSize)
++	}
++	if numObjects == 0 {
++		return nil, errors.New("bad property list: binary property list holds no objects")
++	}
++	if topObject >= numObjects {
++		return nil, errors.New("bad property list: root object reference is out of range")
++	}
++
++	tableSize := numObjects * uint64(offsetSize)
++	trailerStart := uint64(len(document) - binaryPlistTrailerSize)
++	if offsetTableOffset > trailerStart || tableSize > trailerStart-offsetTableOffset {
++		return nil, errors.New("bad property list: offset table is out of range")
++	}
++
++	offsets := make([]uint64, numObjects)
++	for index := uint64(0); index < numObjects; index++ {
++		start := offsetTableOffset + index*uint64(offsetSize)
++		offsets[index] = readBinaryPlistUint(document[start : start+uint64(offsetSize)])
++	}
++
++	parser := &binaryPlistParser{
++		document: document,
++		offsets:  offsets,
++		refSize:  refSize,
++		visiting: map[uint64]bool{},
++	}
++
++	return parser.parseObject(topObject)
++}
++
++// readBinaryPlistUint reads a big endian unsigned integer of up to 8 bytes.
++func readBinaryPlistUint(raw []byte) uint64 {
++	var value uint64
++	for _, singleByte := range raw {
++		value = value<<8 | uint64(singleByte)
++	}
++	return value
++}
++
++// objectStart validates a reference and returns the offset it points at.
++func (p *binaryPlistParser) objectStart(ref uint64) (uint64, error) {
++	if ref >= uint64(len(p.offsets)) {
++		return 0, fmt.Errorf("bad property list: object reference %v is out of range", ref)
++	}
++	offset := p.offsets[ref]
++	if offset >= uint64(len(p.document)-binaryPlistTrailerSize) {
++		return 0, fmt.Errorf("bad property list: object %v points outside the document", ref)
++	}
++	return offset, nil
++}
++
++// slice returns length bytes at offset, checking that they are inside the
++// object area of the document.
++func (p *binaryPlistParser) slice(offset uint64, length uint64) ([]byte, error) {
++	limit := uint64(len(p.document) - binaryPlistTrailerSize)
++	if offset > limit || length > limit-offset {
++		return nil, errors.New("bad property list: object extends past the end of the document")
++	}
++	return p.document[offset : offset+length], nil
++}
++
++// readCount reads the size held in the low nibble of an object marker. A nibble
++// of 0xF means the real count is held in an integer object that follows.
++func (p *binaryPlistParser) readCount(offset uint64) (uint64, uint64, error) {
++	marker, err := p.slice(offset, 1)
++	if err != nil {
++		return 0, 0, err
++	}
++
++	low := uint64(marker[0] & 0x0F)
++	if low != 0x0F {
++		return low, offset + 1, nil
++	}
++
++	sizeMarker, err := p.slice(offset+1, 1)
++	if err != nil {
++		return 0, 0, err
++	}
++	if sizeMarker[0]>>4 != binaryPlistMarkerInt {
++		return 0, 0, errors.New("bad property list: object size is not an integer")
++	}
++
++	width := uint64(1) << (sizeMarker[0] & 0x0F)
++	if width > 8 {
++		return 0, 0, errors.New("bad property list: object size is too wide")
++	}
++	raw, err := p.slice(offset+2, width)
++	if err != nil {
++		return 0, 0, err
++	}
++
++	return readBinaryPlistUint(raw), offset + 2 + width, nil
++}
++
++// readRefs reads count object references.
++func (p *binaryPlistParser) readRefs(offset uint64, count uint64) ([]uint64, error) {
++	width := uint64(p.refSize)
++	raw, err := p.slice(offset, count*width)
++	if err != nil {
++		return nil, err
++	}
++
++	refs := make([]uint64, count)
++	for index := uint64(0); index < count; index++ {
++		refs[index] = readBinaryPlistUint(raw[index*width : (index+1)*width])
++	}
++	return refs, nil
++}
++
++func (p *binaryPlistParser) parseObject(ref uint64) (*CandidateNode, error) {
++	if p.visiting[ref] {
++		return nil, errors.New("bad property list: object refers back to itself")
++	}
++	p.visiting[ref] = true
++	defer delete(p.visiting, ref)
++
++	offset, err := p.objectStart(ref)
++	if err != nil {
++		return nil, err
++	}
++
++	marker := p.document[offset]
++	switch marker >> 4 {
++	case binaryPlistMarkerSingleton:
++		switch marker {
++		case 0x08:
++			return createPlistScalar("!!bool", plistElementFalse), nil
++		case 0x09:
++			return createPlistScalar("!!bool", plistElementTrue), nil
++		default:
++			return nil, fmt.Errorf("bad property list: unsupported object marker 0x%02x", marker)
++		}
++	case binaryPlistMarkerInt:
++		return p.parseInt(offset)
++	case binaryPlistMarkerReal:
++		return p.parseReal(offset)
++	case binaryPlistMarkerDate:
++		return p.parseDate(offset)
++	case binaryPlistMarkerData:
++		return p.parseData(offset)
++	case binaryPlistMarkerASCII:
++		return p.parseASCIIString(offset)
++	case binaryPlistMarkerUnicode:
++		return p.parseUnicodeString(offset)
++	case binaryPlistMarkerArray:
++		return p.parseArray(offset)
++	case binaryPlistMarkerDict:
++		return p.parseDict(offset)
++	default:
++		return nil, fmt.Errorf("bad property list: unsupported object marker 0x%02x", marker)
++	}
++}
++
++// parseInt reads an integer. Widths of one, two and four bytes are unsigned,
++// wider ones are signed.
++func (p *binaryPlistParser) parseInt(offset uint64) (*CandidateNode, error) {
++	width := uint64(1) << (p.document[offset] & 0x0F)
++	if width > 16 {
++		return nil, errors.New("bad property list: integer is too wide")
++	}
++	raw, err := p.slice(offset+1, width)
++	if err != nil {
++		return nil, err
++	}
++
++	if width > 8 {
++		// only the low 8 bytes can be represented, the rest must be sign padding
++		padding := raw[:width-8]
++		expected := byte(0x00)
++		if raw[width-8]&0x80 != 0 {
++			expected = 0xFF
++		}
++		for _, singleByte := range padding {
++			if singleByte != expected {
++				return nil, errors.New("bad property list: integer is out of range")
++			}
++		}
++		raw = raw[width-8:]
++	}
++
++	value := readBinaryPlistUint(raw)
++	if width >= 8 {
++		return createPlistScalar("!!int", strconv.FormatInt(int64(value), 10)), nil
++	}
++	return createPlistScalar("!!int", strconv.FormatUint(value, 10)), nil
++}
++
++func (p *binaryPlistParser) parseReal(offset uint64) (*CandidateNode, error) {
++	width := uint64(1) << (p.document[offset] & 0x0F)
++	raw, err := p.slice(offset+1, width)
++	if err != nil {
++		return nil, err
++	}
++
++	var value float64
++	switch width {
++	case 4:
++		value = float64(math.Float32frombits(binary.BigEndian.Uint32(raw)))
++	case 8:
++		value = math.Float64frombits(binary.BigEndian.Uint64(raw))
++	default:
++		return nil, fmt.Errorf("bad property list: unsupported real width %v", width)
++	}
++
++	return createPlistScalar("!!float", formatPlistFloat(value)), nil
++}
++
++func (p *binaryPlistParser) parseDate(offset uint64) (*CandidateNode, error) {
++	if p.document[offset] != 0x33 {
++		return nil, errors.New("bad property list: unsupported date width")
++	}
++	raw, err := p.slice(offset+1, 8)
++	if err != nil {
++		return nil, err
++	}
++
++	seconds := math.Float64frombits(binary.BigEndian.Uint64(raw))
++	if math.IsNaN(seconds) || math.IsInf(seconds, 0) {
++		return nil, errors.New("bad property list: date is not a valid number")
++	}
++
++	whole, fraction := math.Modf(seconds)
++	nanoseconds := int64(math.Round(fraction * float64(time.Second)))
++	stamp := time.Unix(int64(whole)+binaryPlistEpoch, nanoseconds).UTC()
++
++	return createPlistScalar("!!timestamp", stamp.Format(time.RFC3339)), nil
++}
++
++func (p *binaryPlistParser) parseData(offset uint64) (*CandidateNode, error) {
++	count, start, err := p.readCount(offset)
++	if err != nil {
++		return nil, err
++	}
++	raw, err := p.slice(start, count)
++	if err != nil {
++		return nil, err
++	}
++
++	return createPlistScalar("!!binary", base64.StdEncoding.EncodeToString(raw)), nil
++}
++
++func (p *binaryPlistParser) parseASCIIString(offset uint64) (*CandidateNode, error) {
++	count, start, err := p.readCount(offset)
++	if err != nil {
++		return nil, err
++	}
++	raw, err := p.slice(start, count)
++	if err != nil {
++		return nil, err
++	}
++
++	return createPlistScalar("!!str", string(raw)), nil
++}
++
++// parseUnicodeString reads a big endian UTF-16 string. The count is the number
++// of code units, not the number of bytes.
++func (p *binaryPlistParser) parseUnicodeString(offset uint64) (*CandidateNode, error) {
++	count, start, err := p.readCount(offset)
++	if err != nil {
++		return nil, err
++	}
++	raw, err := p.slice(start, count*2)
++	if err != nil {
++		return nil, err
++	}
++
++	units := make([]uint16, count)
++	for index := uint64(0); index < count; index++ {
++		units[index] = binary.BigEndian.Uint16(raw[index*2 : index*2+2])
++	}
++
++	return createPlistScalar("!!str", string(utf16.Decode(units))), nil
++}
++
++func (p *binaryPlistParser) parseArray(offset uint64) (*CandidateNode, error) {
++	count, start, err := p.readCount(offset)
++	if err != nil {
++		return nil, err
++	}
++	refs, err := p.readRefs(start, count)
++	if err != nil {
++		return nil, err
++	}
++
++	node := &CandidateNode{Kind: SequenceNode, Tag: "!!seq"}
++	for _, ref := range refs {
++		child, err := p.parseObject(ref)
++		if err != nil {
++			return nil, err
++		}
++		node.AddChild(child)
++	}
++
++	return node, nil
++}
++
++func (p *binaryPlistParser) parseDict(offset uint64) (*CandidateNode, error) {
++	count, start, err := p.readCount(offset)
++	if err != nil {
++		return nil, err
++	}
++	refs, err := p.readRefs(start, count*2)
++	if err != nil {
++		return nil, err
++	}
++
++	node := &CandidateNode{Kind: MappingNode, Tag: "!!map"}
++	for index := uint64(0); index < count; index++ {
++		key, err := p.parseObject(refs[index])
++		if err != nil {
++			return nil, err
++		}
++		if key.Tag != "!!str" {
++			return nil, errors.New("bad property list: dictionary keys must be strings")
++		}
++
++		value, err := p.parseObject(refs[count+index])
++		if err != nil {
++			return nil, err
++		}
++		node.AddKeyValueChild(createStringScalarNode(key.Value), value)
++	}
++
++	return node, nil
++}
++
++// formatPlistFloat renders a float without an exponent where it can, so that
++// values survive a round trip through the xml format.
++func formatPlistFloat(value float64) string {
++	if math.IsInf(value, 1) {
++		return ".inf"
++	}
++	if math.IsInf(value, -1) {
++		return "-.inf"
++	}
++	if math.IsNaN(value) {
++		return ".nan"
++	}
++	return strconv.FormatFloat(value, 'f', -1, 64)
++}
+diff --git a/pkg/yqlib/encoder_plist.go b/pkg/yqlib/encoder_plist.go
+new file mode 100644
+index 00000000..4eef82c0
+--- /dev/null
++++ b/pkg/yqlib/encoder_plist.go
+@@ -0,0 +1,175 @@
++//go:build !yq_noplist
++
++package yqlib
++
++import (
++	"bytes"
++	"encoding/base64"
++	"encoding/xml"
++	"errors"
++	"fmt"
++	"io"
++	"strings"
++)
++
++const (
++	plistXMLHeader = `<?xml version="1.0" encoding="UTF-8"?>
++<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
++<plist version="1.0">
++`
++	plistXMLFooter = `</plist>
++`
++	plistIndent = "\t"
++)
++
++type plistEncoder struct {
++}
++
++func NewPlistEncoder() Encoder {
++	return &plistEncoder{}
++}
++
++func (e *plistEncoder) CanHandleAliases() bool {
++	return false
++}
++
++func (e *plistEncoder) PrintDocumentSeparator(_ io.Writer) error {
++	return nil
++}
++
++func (e *plistEncoder) PrintLeadingContent(_ io.Writer, _ string) error {
++	return nil
++}
++
++func (e *plistEncoder) Encode(writer io.Writer, node *CandidateNode) error {
++	if err := writeString(writer, plistXMLHeader); err != nil {
++		return err
++	}
++	if err := e.encodeValue(writer, node, 0); err != nil {
++		return err
++	}
++	return writeString(writer, plistXMLFooter)
++}
++
++func (e *plistEncoder) encodeValue(writer io.Writer, node *CandidateNode, depth int) error {
++	switch node.Kind {
++	case MappingNode:
++		return e.encodeDict(writer, node, depth)
++	case SequenceNode:
++		return e.encodeArray(writer, node, depth)
++	case ScalarNode:
++		return e.encodeScalar(writer, node, depth)
++	case AliasNode:
++		if node.Alias == nil {
++			return errors.New("cannot encode an unresolved alias as a property list")
++		}
++		return e.encodeValue(writer, node.Alias, depth)
++	default:
++		return fmt.Errorf("cannot encode a %v as a property list", node.Kind)
++	}
++}
++
++func (e *plistEncoder) encodeDict(writer io.Writer, node *CandidateNode, depth int) error {
++	if len(node.Content) == 0 {
++		return writeString(writer, plistIndentation(depth)+"<dict/>\n")
++	}
++
++	if err := writeString(writer, plistIndentation(depth)+"<dict>\n"); err != nil {
++		return err
++	}
++
++	for index := 0; index < len(node.Content); index += 2 {
++		key := node.Content[index]
++		value := node.Content[index+1]
++
++		if key.Kind != ScalarNode {
++			return errors.New("property list dictionary keys must be scalars")
++		}
++
++		escapedKey, err := escapePlistText(key.Value)
++		if err != nil {
++			return err
++		}
++		keyLine := fmt.Sprintf("%v<key>%v</key>\n", plistIndentation(depth+1), escapedKey)
++		if err := writeString(writer, keyLine); err != nil {
++			return err
++		}
++
++		if err := e.encodeValue(writer, value, depth+1); err != nil {
++			return err
++		}
++	}
++
++	return writeString(writer, plistIndentation(depth)+"</dict>\n")
++}
++
++func (e *plistEncoder) encodeArray(writer io.Writer, node *CandidateNode, depth int) error {
++	if len(node.Content) == 0 {
++		return writeString(writer, plistIndentation(depth)+"<array/>\n")
++	}
++
++	if err := writeString(writer, plistIndentation(depth)+"<array>\n"); err != nil {
++		return err
++	}
++
++	for _, child := range node.Content {
++		if err := e.encodeValue(writer, child, depth+1); err != nil {
++			return err
++		}
++	}
++
++	return writeString(writer, plistIndentation(depth)+"</array>\n")
++}
++
++func (e *plistEncoder) encodeScalar(writer io.Writer, node *CandidateNode, depth int) error {
++	indentation := plistIndentation(depth)
++
++	switch node.Tag {
++	case "!!null":
++		return errors.New("property lists cannot hold null values")
++	case "!!bool":
++		element := plistElementFalse
++		if isTruthyPlistValue(node.Value) {
++			element = plistElementTrue
++		}
++		return writeString(writer, fmt.Sprintf("%v<%v/>\n", indentation, element))
++	case "!!int":
++		return writePlistElement(writer, indentation, plistElementInteger, node.Value)
++	case "!!float":
++		return writePlistElement(writer, indentation, plistElementReal, node.Value)
++	case "!!timestamp":
++		return writePlistElement(writer, indentation, plistElementDate, node.Value)
++	case "!!binary":
++		encoded := stripPlistWhitespace(node.Value)
++		if _, err := base64.StdEncoding.DecodeString(encoded); err != nil {
++			return errors.New("cannot encode a binary value that is not valid base64 as a property list")
++		}
++		return writePlistElement(writer, indentation, plistElementData, encoded)
++	default:
++		return writePlistElement(writer, indentation, plistElementString, node.Value)
++	}
++}
++
++func writePlistElement(writer io.Writer, indentation string, element string, value string) error {
++	escaped, err := escapePlistText(value)
++	if err != nil {
++		return err
++	}
++	return writeString(writer, fmt.Sprintf("%v<%v>%v</%v>\n", indentation, element, escaped, element))
++}
++
++func escapePlistText(value string) (string, error) {
++	var escaped bytes.Buffer
++	if err := xml.EscapeText(&escaped, []byte(value)); err != nil {
++		return "", err
++	}
++	return escaped.String(), nil
++}
++
++func plistIndentation(depth int) string {
++	return strings.Repeat(plistIndent, depth)
++}
++
++func isTruthyPlistValue(value string) bool {
++	return strings.EqualFold(value, plistElementTrue)
++}
+diff --git a/pkg/yqlib/encoder_plist_binary.go b/pkg/yqlib/encoder_plist_binary.go
+new file mode 100644
+index 00000000..9b542cc2
+--- /dev/null
++++ b/pkg/yqlib/encoder_plist_binary.go
+@@ -0,0 +1,339 @@
++//go:build !yq_noplist
++
++package yqlib
++
++import (
++	"encoding/base64"
++	"encoding/binary"
++	"errors"
++	"fmt"
++	"io"
++	"math"
++	"strconv"
++	"time"
++	"unicode/utf16"
++)
++
++// binaryPlistDateFormats are the layouts accepted for a !!timestamp value.
++var binaryPlistDateFormats = []string{
++	time.RFC3339Nano,
++	"2006-01-02T15:04:05",
++	"2006-01-02 15:04:05",
++	"2006-01-02",
++}
++
++// binaryPlistObject is one entry of the object table. Scalars carry their
++// finished encoding, containers carry the references they point at, because
++// reference width is only known once every object has been collected.
++type binaryPlistObject struct {
++	scalar    []byte
++	refs      []uint64
++	container byte
++	count     uint64
++}
++
++type binaryPlistBuilder struct {
++	objects []binaryPlistObject
++	// interned maps an encoded scalar to its reference, so that repeated
++	// values are stored once, as CoreFoundation does.
++	interned map[string]uint64
++}
++
++type binaryPlistEncoder struct {
++}
++
++func NewBinaryPlistEncoder() Encoder {
++	return &binaryPlistEncoder{}
++}
++
++func (e *binaryPlistEncoder) CanHandleAliases() bool {
++	return false
++}
++
++func (e *binaryPlistEncoder) PrintDocumentSeparator(_ io.Writer) error {
++	return nil
++}
++
++func (e *binaryPlistEncoder) PrintLeadingContent(_ io.Writer, _ string) error {
++	return nil
++}
++
++func (e *binaryPlistEncoder) Encode(writer io.Writer, node *CandidateNode) error {
++	builder := &binaryPlistBuilder{interned: map[string]uint64{}}
++
++	root, err := builder.addNode(node)
++	if err != nil {
++		return err
++	}
++
++	return builder.write(writer, root)
++}
++
++func (b *binaryPlistBuilder) addNode(node *CandidateNode) (uint64, error) {
++	switch node.Kind {
++	case MappingNode:
++		return b.addDict(node)
++	case SequenceNode:
++		return b.addArray(node)
++	case ScalarNode:
++		return b.addScalar(node)
++	case AliasNode:
++		if node.Alias == nil {
++			return 0, errors.New("cannot encode an unresolved alias as a property list")
++		}
++		return b.addNode(node.Alias)
++	default:
++		return 0, fmt.Errorf("cannot encode a %v as a property list", node.Kind)
++	}
++}
++
++// appendObject stores an object and returns its reference.
++func (b *binaryPlistBuilder) appendObject(object binaryPlistObject) uint64 {
++	b.objects = append(b.objects, object)
++	return uint64(len(b.objects) - 1)
++}
++
++// appendScalar stores a scalar, reusing an identical one when it is already held.
++func (b *binaryPlistBuilder) appendScalar(encoded []byte) uint64 {
++	if ref, found := b.interned[string(encoded)]; found {
++		return ref
++	}
++	ref := b.appendObject(binaryPlistObject{scalar: encoded})
++	b.interned[string(encoded)] = ref
++	return ref
++}
++
++func (b *binaryPlistBuilder) addDict(node *CandidateNode) (uint64, error) {
++	count := uint64(len(node.Content) / 2)
++	keyRefs := make([]uint64, 0, count)
++	valueRefs := make([]uint64, 0, count)
++
++	for index := 0; index < len(node.Content); index += 2 {
++		key := node.Content[index]
++		if key.Kind != ScalarNode {
++			return 0, errors.New("property list dictionary keys must be scalars")
++		}
++
++		keyRef := b.appendScalar(encodeBinaryPlistString(key.Value))
++		valueRef, err := b.addNode(node.Content[index+1])
++		if err != nil {
++			return 0, err
++		}
++
++		keyRefs = append(keyRefs, keyRef)
++		valueRefs = append(valueRefs, valueRef)
++	}
++
++	return b.appendObject(binaryPlistObject{
++		container: binaryPlistMarkerDict,
++		count:     count,
++		refs:      append(keyRefs, valueRefs...),
++	}), nil
++}
++
++func (b *binaryPlistBuilder) addArray(node *CandidateNode) (uint64, error) {
++	refs := make([]uint64, 0, len(node.Content))
++
++	for _, child := range node.Content {
++		ref, err := b.addNode(child)
++		if err != nil {
++			return 0, err
++		}
++		refs = append(refs, ref)
++	}
++
++	return b.appendObject(binaryPlistObject{
++		container: binaryPlistMarkerArray,
++		count:     uint64(len(refs)),
++		refs:      refs,
++	}), nil
++}
++
++func (b *binaryPlistBuilder) addScalar(node *CandidateNode) (uint64, error) {
++	switch node.Tag {
++	case "!!null":
++		return 0, errors.New("property lists cannot hold null values")
++	case "!!bool":
++		marker := byte(0x08)
++		if isTruthyPlistValue(node.Value) {
++			marker = 0x09
++		}
++		return b.appendScalar([]byte{marker}), nil
++	case "!!int":
++		value, err := strconv.ParseInt(node.Value, 10, 64)
++		if err != nil {
++			return 0, fmt.Errorf("cannot encode %v as a property list integer", node.Value)
++		}
++		return b.appendScalar(encodeBinaryPlistInt(value)), nil
++	case "!!float":
++		value, err := strconv.ParseFloat(node.Value, 64)
++		if err != nil {
++			return 0, fmt.Errorf("cannot encode %v as a property list real", node.Value)
++		}
++		return b.appendScalar(encodeBinaryPlistReal(value)), nil
++	case "!!timestamp":
++		stamp, err := parseBinaryPlistDate(node.Value)
++		if err != nil {
++			return 0, err
++		}
++		return b.appendScalar(encodeBinaryPlistDate(stamp)), nil
++	case "!!binary":
++		raw, err := base64.StdEncoding.DecodeString(stripPlistWhitespace(node.Value))
++		if err != nil {
++			return 0, errors.New("cannot encode a binary value that is not valid base64 as a property list")
++		}
++		return b.appendScalar(encodeBinaryPlistData(raw)), nil
++	default:
++		return b.appendScalar(encodeBinaryPlistString(node.Value)), nil
++	}
++}
++
++// write lays the collected objects out into a complete binary property list.
++func (b *binaryPlistBuilder) write(writer io.Writer, root uint64) error {
++	numObjects := uint64(len(b.objects))
++	refSize := binaryPlistWidthFor(numObjects)
++
++	bodies := make([][]byte, numObjects)
++	offsets := make([]uint64, numObjects)
++	position := uint64(len(binaryPlistMagic) + 2)
++
++	for index, object := range b.objects {
++		offsets[index] = position
++		if object.scalar != nil {
++			bodies[index] = object.scalar
++		} else {
++			bodies[index] = encodeBinaryPlistContainer(object, refSize)
++		}
++		position += uint64(len(bodies[index]))
++	}
++
++	offsetTableOffset := position
++	offsetSize := binaryPlistWidthFor(offsetTableOffset)
++
++	document := make([]byte, 0, offsetTableOffset+numObjects*uint64(offsetSize)+binaryPlistTrailerSize)
++	document = append(document, []byte(binaryPlistMagic+"00")...)
++	for _, body := range bodies {
++		document = append(document, body...)
++	}
++	for _, offset := range offsets {
++		document = append(document, encodeBinaryPlistUint(offset, offsetSize)...)
++	}
++
++	trailer := make([]byte, binaryPlistTrailerSize)
++	trailer[6] = offsetSize
++	trailer[7] = refSize
++	binary.BigEndian.PutUint64(trailer[8:16], numObjects)
++	binary.BigEndian.PutUint64(trailer[16:24], root)
++	binary.BigEndian.PutUint64(trailer[24:32], offsetTableOffset)
++	document = append(document, trailer...)
++
++	_, err := writer.Write(document)
++	return err
++}
++
++func encodeBinaryPlistContainer(object binaryPlistObject, refSize byte) []byte {
++	encoded := encodeBinaryPlistMarker(object.container, object.count)
++	for _, ref := range object.refs {
++		encoded = append(encoded, encodeBinaryPlistUint(ref, refSize)...)
++	}
++	return encoded
++}
++
++// encodeBinaryPlistMarker writes a type marker and its size. Sizes of fifteen or
++// more are held in an integer object that follows the marker.
++func encodeBinaryPlistMarker(marker byte, count uint64) []byte {
++	if count < 0x0F {
++		return []byte{marker<<4 | byte(count)}
++	}
++	return append([]byte{marker<<4 | 0x0F}, encodeBinaryPlistInt(int64(count))...)
++}
++
++func encodeBinaryPlistInt(value int64) []byte {
++	switch {
++	case value >= 0 && value <= math.MaxUint8:
++		return []byte{binaryPlistMarkerInt << 4, byte(value)}
++	case value >= 0 && value <= math.MaxUint16:
++		return append([]byte{binaryPlistMarkerInt<<4 | 0x01}, encodeBinaryPlistUint(uint64(value), 2)...)
++	case value >= 0 && value <= math.MaxUint32:
++		return append([]byte{binaryPlistMarkerInt<<4 | 0x02}, encodeBinaryPlistUint(uint64(value), 4)...)
++	default:
++		return append([]byte{binaryPlistMarkerInt<<4 | 0x03}, encodeBinaryPlistUint(uint64(value), 8)...)
++	}
++}
++
++func encodeBinaryPlistReal(value float64) []byte {
++	encoded := make([]byte, 9)
++	encoded[0] = binaryPlistMarkerReal<<4 | 0x03
++	binary.BigEndian.PutUint64(encoded[1:], math.Float64bits(value))
++	return encoded
++}
++
++func encodeBinaryPlistDate(stamp time.Time) []byte {
++	seconds := float64(stamp.UnixNano())/float64(time.Second) - binaryPlistEpoch
++
++	encoded := make([]byte, 9)
++	encoded[0] = binaryPlistMarkerDate<<4 | 0x03
++	binary.BigEndian.PutUint64(encoded[1:], math.Float64bits(seconds))
++	return encoded
++}
++
++func encodeBinaryPlistData(raw []byte) []byte {
++	return append(encodeBinaryPlistMarker(binaryPlistMarkerData, uint64(len(raw))), raw...)
++}
++
++// encodeBinaryPlistString writes ascii where it can, and big endian utf-16
++// otherwise.
++func encodeBinaryPlistString(value string) []byte {
++	if isASCIIPlistString(value) {
++		return append(encodeBinaryPlistMarker(binaryPlistMarkerASCII, uint64(len(value))), []byte(value)...)
++	}
++
++	units := utf16.Encode([]rune(value))
++	encoded := encodeBinaryPlistMarker(binaryPlistMarkerUnicode, uint64(len(units)))
++	for _, unit := range units {
++		encoded = append(encoded, byte(unit>>8), byte(unit))
++	}
++	return encoded
++}
++
++func isASCIIPlistString(value string) bool {
++	for index := 0; index < len(value); index++ {
++		if value[index] >= 0x80 {
++			return false
++		}
++	}
++	return true
++}
++
++// encodeBinaryPlistUint writes value big endian in exactly width bytes.
++func encodeBinaryPlistUint(value uint64, width byte) []byte {
++	encoded := make([]byte, width)
++	for index := int(width) - 1; index >= 0; index-- {
++		encoded[index] = byte(value)
++		value >>= 8
++	}
++	return encoded
++}
++
++// binaryPlistWidthFor gives the smallest power of two byte width that holds value.
++func binaryPlistWidthFor(value uint64) byte {
++	switch {
++	case value <= math.MaxUint8:
++		return 1
++	case value <= math.MaxUint16:
++		return 2
++	case value <= math.MaxUint32:
++		return 4
++	default:
++		return 8
++	}
++}
++
++func parseBinaryPlistDate(value string) (time.Time, error) {
++	for _, layout := range binaryPlistDateFormats {
++		if stamp, err := time.Parse(layout, value); err == nil {
++			return stamp.UTC(), nil
++		}
++	}
++	return time.Time{}, fmt.Errorf("cannot encode %v as a property list date", value)
++}
+diff --git a/pkg/yqlib/format.go b/pkg/yqlib/format.go
+index 406ab6dd..a4d79100 100644
+--- a/pkg/yqlib/format.go
++++ b/pkg/yqlib/format.go
+@@ -93,6 +93,17 @@ var INIFormat = &Format{"ini", []string{"i"},
+ 	func() Decoder { return NewINIDecoder(ConfiguredINIPreferences) },
+ }
+ 
++var PlistFormat = &Format{"plist", []string{},
++	func() Encoder { return NewPlistEncoder() },
++	func() Decoder { return NewPlistDecoder() },
++}
++
++var BinaryPlistFormat = &Format{"bplist", []string{},
++	func() Encoder { return NewBinaryPlistEncoder() },
++	// the one decoder reads both the xml and the binary flavour
++	func() Decoder { return NewPlistDecoder() },
++}
++
+ var Formats = []*Format{
+ 	YamlFormat,
+ 	KYamlFormat,
+@@ -109,6 +120,8 @@ var Formats = []*Format{
+ 	ShellVariablesFormat,
+ 	LuaFormat,
+ 	INIFormat,
++	PlistFormat,
++	BinaryPlistFormat,
+ }
+ 
+ func (f *Format) MatchesName(name string) bool {
+diff --git a/pkg/yqlib/no_plist.go b/pkg/yqlib/no_plist.go
+new file mode 100644
+index 00000000..ab78db68
+--- /dev/null
++++ b/pkg/yqlib/no_plist.go
+@@ -0,0 +1,15 @@
++//go:build yq_noplist
++
++package yqlib
++
++func NewPlistDecoder() Decoder {
++	return nil
++}
++
++func NewPlistEncoder() Encoder {
++	return nil
++}
++
++func NewBinaryPlistEncoder() Encoder {
++	return nil
++}

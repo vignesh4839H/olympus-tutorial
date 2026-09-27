@@ -1,0 +1,165 @@
+# PocketBase submission — complete
+
+## Deliverables
+
+| Field | Value |
+| --- | --- |
+| Repository | `https://github.com/pocketbase/pocketbase` |
+| Commit | `5684ee24f1e88f71a2ede73d20cf547fbd509e16` |
+| Language | Go |
+| Category | Feature request |
+| Title | Opt-in soft delete with trash and restore for base collections |
+| Task prompt | `task_prompt.md` |
+| Test patch | `test.patch` |
+| Solution patch | `solution.patch` |
+| Dockerfile | `Dockerfile` |
+| Platform check | **eligible · MIT**, no repository reuse warning |
+
+## Measured results
+
+- **786 meaningful production LOC** added by the solution patch (blank lines,
+  comments, imports, braces and test files excluded).
+- **104 graded test cases** in the `softdeletetests` package, with 3802 existing
+  `core`, `apis`, `forms`, `mails` and `tools` cases as the regression gate.
+- Verified in a clean checkout of the pinned commit:
+  - test patch only -> `./test.sh base` **passes**, `./test.sh new` **fails**
+  - test + solution -> `./test.sh base` **passes**, `./test.sh new` **passes**
+- Full `go test ./...` after the solution: everything green except
+  `TestRecordAuthWithOAuth2`, which already fails at the pinned commit because
+  it needs outbound network.
+
+## Rollout findings
+
+The first rollout run solved 0 of 10, which fails the solvability gate. The
+agent runs and the auto review agreed on what was wrong with the task rather
+than with the agents:
+
+- the guest trash purge expected 403 while the repository's own
+  `RequireSuperuserAuth` returns 401, which nine runs hit. The endpoint now
+  uses that middleware and the test expects 401.
+- the multi-relation filter test asserted that `targets ?= 'id'` matches before
+  anything is trashed, which stock PocketBase never does. That was an unrelated
+  change to bare multi-relation filtering, now reverted; the resolver only
+  reroutes single relations, which is the one form that compares a stored key.
+- six runs treated the generated `deleted` field as hidden, so the description
+  now says it stays in the API record.
+- the two rules every run missed, the grouped restore dependency and relation
+  filters in all their spellings, are stated more directly.
+
+## Measuring the rollout instead of guessing at it
+
+The ten agent solutions were replayed against the revised test patch in clean
+checkouts of the pinned commit, which turns the effect of each change into a
+number rather than an opinion:
+
+- the 401 fix removed the guest failure from every run
+- the multi-relation rewrite removed that failure from every run
+- the nonempty update rule and the three level cascade cost nothing: the three
+  closest runs stayed at the same failure count with three more cases
+- the batch restore scenario costs exactly one failure per run, so it is kept
+  only because the description now states it and the registration is three
+  lines
+
+What still fails on every replayed run is the grouped restore dependency and
+the relation filter spellings. Both are what the description now states
+directly, and no replay of the old agent code can show the effect of that.
+
+## Reporting a package that does not build
+
+Without the solution the `core` and `apis` packages do not compile, so `go test`
+emits no test events at all and the JUnit report cannot attribute the failure to
+any test. `test.sh` therefore hands the reporter the list of tests each package
+holds (grepped from the test sources), and the reporter marks exactly those as
+failed. The earlier synthetic `PackageFailure` entry is gone: it named no real
+test, so the verifier could not place it in either the regression or the new
+test set.
+
+## Prior art (found by the Scope Gate)
+
+No soft delete, trash or deleted timestamp exists in the code at the pinned commit,
+but prior art does exist:
+
+- closed PR #7462 implements a collection toggle, timestamp stamping, default query
+  hiding and an include-deleted query
+- issue #2866 has the maintainer deferring generalized soft delete "until a more
+  prominent and clear use case arise"
+
+The Scope Gate passed the submission anyway, rating #7462 at most 1 of 30 graded
+functions and reading #2866 as a hedged deferral rather than a decline. Earlier
+notes in this repo wrongly stated that no such PR or issue existed.
+
+## Feature
+
+Base collections get a `softDelete` option. When it is on, deleting a record
+stamps a `deleted` system field instead of removing the row, the record
+disappears from every read path (queries, finders, list/view endpoints,
+relation and back-relation filters, expand), and it can be restored later.
+
+The difficulty lives in the interactions:
+
+- `RecordQuery` is the base of every read path, so the exclusion has to be
+  correct there and opt-out-able for the trash views.
+- A filter naming a relation compares the stored foreign key without touching
+  the related table, so both `rel` and `rel.id` have to be rerouted through the
+  filtered join once the target collection can hide rows.
+- Unique indexes have to become partial while the mode is on and revert exactly
+  when it is off, otherwise a trashed row blocks its own replacement.
+- Trashing cascades through `CascadeDelete` relations and a restore has to
+  bring back exactly that group, which requires the group timestamp to be
+  unique per delete operation.
+- A restore group is a dependency graph, not a list: one member can
+  cascade-depend on another, so the group has to be collected and validated as
+  a whole before anything is written. Validating each member as it is reached
+  makes the visit order observable and can leave a valid group permanently
+  unrestorable.
+- Permanent deletion keeps the existing cascade, including through records that
+  are themselves in the trash.
+- Collections that do not enable the mode must serialize byte-identically to
+  before, which the repository's own `TestCollectionDBExport` enforces.
+
+## Files touched by the solution
+
+18 files, 2576 diff lines:
+
+`core/record_trash.go` (new), `core/record_query.go`, `core/collection_model.go`,
+`core/record_model.go`, `core/collection_validate.go`,
+`core/collection_model_base_options.go`, `core/collection_record_table_sync.go`,
+`core/record_field_resolver.go`, `core/record_field_resolver_runner.go`,
+`core/record_query_expand.go`, `core/app.go`, `core/base.go`, `core/field.go`,
+`apis/record_crud.go`, `apis/realtime.go`, `apis/batch.go`,
+`forms/record_upsert.go`, `plugins/jsvm/internal/types/generated/types.d.ts`.
+Test files live in the test patch.
+
+### The JSVM declaration file
+
+`make jstypes` rewrites `types.d.ts` with randomized type-alias names, a
+unix-timestamp header and a different namespace order on every run: a straight
+regeneration produced 13878 changed lines of which only about 90 were soft
+delete related. The file in the patch is therefore the generator's output for
+the new declarations only, spliced into the committed file so the diff is the
+245 lines that actually describe the feature (the collection options and
+`isSoftDeleteEnabled`, `Record.isTrashed` / `trashedAt`, and the new app query,
+restore and purge methods) and nothing else.
+
+## Sibling directory
+
+`../rejected-yq-plist/` holds the earlier yq property list submission. It passed
+every precheck but was **rejected at the Scope Gate as publicly-solved**:
+`DHowett/go-plist` implements the same codec. Kept as a record of what the gate
+rejects and why. This feature has no such public equivalent — the hard part is
+PocketBase's own collection, record, query and cascade machinery.
+
+## Dockerfile note
+
+The base image ships Go 1.26.3 with `GOTOOLCHAIN=local`, while the pinned
+commit's `go.mod` requires Go 1.27 (the repository imports the `encoding/json/v2`
+stdlib package in more than ten files). The Dockerfile therefore has to override
+`GOTOOLCHAIN`; without that line the build fails with
+`go: go.mod requires go >= 1.27 (running go 1.26.3; GOTOOLCHAIN=local)`.
+Either `auto` or an exact pin works. Downgrading `go.mod` is not an option: it
+would fail on the missing stdlib package instead, and it would mean editing
+upstream code at a fixed commit.
+
+The module files are copied and the dependencies downloaded before the rest of
+the source, so the download layer is reused whenever only code changes.
+

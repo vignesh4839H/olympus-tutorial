@@ -1,0 +1,45 @@
+
+func TestSoftDeleteProbeB_ExecuteChainRunsOnTrash(t *testing.T) {
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	posts, _, _ := sdSetup(t, app)
+
+	fired := 0
+	app.OnRecordDeleteExecute(posts.Name).BindFunc(func(e *core.RecordEvent) error {
+		fired++
+		return e.Next()
+	})
+
+	record := sdNewRecord(t, app, posts, map[string]any{"title": "hooked"})
+
+	if err := app.Delete(record); err != nil {
+		t.Fatal(err)
+	}
+
+	if fired != 1 {
+		t.Fatalf("expected a handler bound after the trash to still run, fired %d times", fired)
+	}
+
+	if !sdRawExists(t, app, posts, record.Id) {
+		t.Fatal("expected the trashed row to still be there")
+	}
+}
+
+func TestSoftDeleteProbeC_WithTrashedReadsOrdinaryCollections(t *testing.T) {
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	_, _, plain := sdSetup(t, app)
+
+	record := sdNewRecord(t, app, plain, map[string]any{"title": "plain"})
+
+	found, err := app.FindRecordByIdWithTrashed(plain, record.Id)
+	if err != nil {
+		t.Fatalf("expected the lookup to still read a collection without the mode, got %v", err)
+	}
+
+	if found.Id != record.Id {
+		t.Fatalf("expected %q, got %q", record.Id, found.Id)
+	}
+}
