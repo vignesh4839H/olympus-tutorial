@@ -1,0 +1,73 @@
+
+func TestSoftDeleteProbeD_TrashKeepsUploadedFiles(t *testing.T) {
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	collection := core.NewBaseCollection("sd_probe_files")
+	collection.Fields.Add(&core.TextField{Name: "title"})
+	collection.Fields.Add(&core.FileField{Name: "doc", MaxSelect: 1, MaxSize: 999999})
+	collection.SoftDelete = true
+	if err := app.Save(collection); err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := filesystem.NewFileFromBytes([]byte("hello"), "probe.txt")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	record := core.NewRecord(collection)
+	record.Set("title", "with file")
+	record.Set("doc", f)
+	if err := app.Save(record); err != nil {
+		t.Fatal(err)
+	}
+
+	stored := record.GetString("doc")
+	if stored == "" {
+		t.Fatal("expected the file to be stored")
+	}
+
+	fsys, err := app.NewFilesystem()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fsys.Close()
+
+	key := record.BaseFilesPath() + "/" + stored
+
+	if err := app.Delete(record); err != nil {
+		t.Fatal(err)
+	}
+
+	// trashing is restorable, so the payload has to survive it
+	if exists, _ := fsys.Exists(key); !exists {
+		t.Fatal("expected the uploaded file to survive the trash")
+	}
+
+}
+
+func TestSoftDeleteProbeE_HugeRetentionKeepsTheTrash(t *testing.T) {
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	posts, _, _ := sdSetup(t, app)
+
+	posts.TrashRetention = 1 << 40
+	if err := app.Save(posts); err != nil {
+		t.Fatal(err)
+	}
+
+	record := sdNewRecord(t, app, posts, map[string]any{"title": "kept"})
+	if err := app.Delete(record); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := app.PurgeExpiredTrashedRecords(); err != nil {
+		t.Fatalf("expected a very large retention to be handled, got %v", err)
+	}
+
+	if _, err := app.FindTrashedRecordById(posts, record.Id); err != nil {
+		t.Fatalf("expected the record to stay in the trash, got %v", err)
+	}
+}

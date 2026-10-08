@@ -1,0 +1,51 @@
+func TestSoftDeleteClearedStampCannotReviveAStandaloneRecord(t *testing.T) {
+	app, _ := tests.NewTestApp()
+	defer app.Cleanup()
+
+	// a collection that points nowhere, so nothing but the record's own trash
+	// state can refuse the save. The cascade variant below cannot tell the two
+	// apart: a parent still in the trash rejects it through the relation
+	collection := core.NewBaseCollection("sd_standalone_save")
+	collection.SoftDelete = true
+	collection.Fields.Add(&core.TextField{Name: "message"})
+	if err := app.Save(collection); err != nil {
+		t.Fatal(err)
+	}
+
+	record := sdNewRecord(t, app, collection, map[string]any{"message": "trashed"})
+
+	if err := app.Delete(record); err != nil {
+		t.Fatal(err)
+	}
+
+	trashed, err := app.FindTrashedRecordById(collection, record.Id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// the stamp is the caller's to edit and the row's to keep: clearing one
+	// must not move the other
+	trashed.Set(core.FieldNameDeleted, "")
+	trashed.Set("message", "sneaked back")
+
+	if err := app.Save(trashed); err == nil {
+		t.Fatal("expected an ordinary save to be refused for a trashed record")
+	}
+
+	if _, err := app.FindRecordById(collection, record.Id); !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("expected the record to stay in the trash, got %v", err)
+	}
+
+	reloaded, err := app.FindTrashedRecordById(collection, record.Id)
+	if err != nil {
+		t.Fatalf("expected the record to still be in the trash: %v", err)
+	}
+
+	if !reloaded.IsTrashed() {
+		t.Fatal("expected the persisted record to still read as trashed")
+	}
+
+	if reloaded.GetString("message") != "trashed" {
+		t.Fatalf("expected the message to be unchanged, got %q", reloaded.GetString("message"))
+	}
+}
